@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+venv/
+.venv/
+env/
+ENV/
+pip-selfcheck.json
+*.egg-info/
+.python-version
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
