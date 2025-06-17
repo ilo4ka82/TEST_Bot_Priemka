@@ -1,19 +1,57 @@
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
+# Файл переменных окружения
+# Не коммитьте ваши секреты!
+.env
+*.env
+.env.*
+!/.env.example # Если у вас есть example-файл, который можно коммитить
 
-# Virtual environment
+
+# Виртуальное окружение
+# Добавьте сюда имя вашего venv, если оно отличается
 venv/
 .venv/
 env/
 ENV/
 pip-selfcheck.json
-*.egg-info/
-.python-version
+# .python-version # Раскомментируйте, если не хотите делиться версией python через pyenv
 
-# IDE / Editor
+
+# Файлы баз данных
+# Игнорируем все файлы баз данных SQLite и другие распространенные
+*.db
+*.sqlite
+*.sqlite3
+# time_tracker_prod.db
+# time_tracker_dev.db
+
+
+# Python кэш и скомпилированные файлы
+__pycache__/
+*.py[cod] # .pyc, .pyo, .pyd
+*$py.class # Для Jython или других специфичных случаев
+*.egg-info/ # Метаданные пакетов
+.eggs/
+eggs/
+
+
+# Локальные настройки IDE и редакторов
 .vscode/
-.idea/
-*.swp
-*.swo
+.idea/ # Для продуктов JetBrains (PyCharm, IntelliJ IDEA и т.д.)
+*.swp # Vim swap files
+*.swo # Vim swap files
+# *.sublime-workspace # Для Sublime Text, если используете
+
+
+# Логи
+logs/
+*.log
+
+
+# Файлы операционной системы
+.DS_Store # macOS
+Thumbs.db # Windows
+
+
+# Директории сборки/дистрибуции 
+build/
+dist/
