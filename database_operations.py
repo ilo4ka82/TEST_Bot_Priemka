@@ -2,18 +2,15 @@ import sqlite3
 import logging
 from datetime import datetime, timedelta
 from pytz import timezone as pytz_timezone, utc
-from dotenv import load_dotenv
-
-load_dotenv()
-
-DATABASE_NAME = os.getenv("DATABASE_PATH")
+from config import DATABASE_PATH
 
 logger = logging.getLogger(__name__)
 
 def get_db_connection():
-    conn = sqlite3.connect(DATABASE_NAME)
+    conn = sqlite3.connect(DATABASE_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
 
 # В файле database_operations.py
 def init_db():
