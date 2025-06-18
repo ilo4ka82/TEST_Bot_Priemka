@@ -2,8 +2,11 @@ import sqlite3
 import logging
 from datetime import datetime, timedelta
 from pytz import timezone as pytz_timezone, utc
+from dotenv import load_dotenv
 
-from config import DATABASE_NAME
+load_dotenv()
+
+DATABASE_NAME = os.getenv("DATABASE_PATH")
 
 logger = logging.getLogger(__name__)
 

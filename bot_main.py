@@ -14,6 +14,8 @@ from openpyxl.styles import Font
 from config import TELEGRAM_BOT_TOKEN, ADMIN_TELEGRAM_IDS, THE_OFFICE_ZONE, ITEMS_PER_PAGE, SECTOR_WEEKLY_NORMS 
 from telegram_bot_calendar import DetailedTelegramCalendar, LSTEP 
 import database_operations as db
+from dotenv import load_dotenv
+
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
