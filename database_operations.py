@@ -755,7 +755,7 @@ def get_unique_user_departments() -> list:
 def get_active_users_by_department(department: str) -> list:
     """
     Возвращает УНИКАЛЬНЫЙ список пользователей с их САМОЙ ПОСЛЕДНЕЙ активной сессией.
-    Использует application_full_name для ФИО.
+    Данные отсортированы по ДЕПАРТАМЕНТУ, а затем по ФИО.
     """
     conn = None
     try:
@@ -765,7 +765,7 @@ def get_active_users_by_department(department: str) -> list:
 
         sql_query = """
             SELECT
-                u.application_full_name, -- <--- ГЛАВНОЕ ИЗМЕНЕНИЕ
+                u.application_full_name,
                 u.username,
                 u.application_department,
                 t.max_check_in_time AS check_in_time
@@ -780,8 +780,9 @@ def get_active_users_by_department(department: str) -> list:
             JOIN users u ON t.telegram_id = u.telegram_id
             WHERE
                 (? = 'ALL' OR u.application_department = ?)
+            -- --- ГЛАВНОЕ ИЗМЕНЕНИЕ: СОРТИРУЕМ ПО ФИО ---
             ORDER BY
-                u.application_department, max_check_in_time ASC;
+                u.application_department, u.application_full_name ASC;
         """
         
         cursor.execute(sql_query, (department, department))
@@ -795,6 +796,7 @@ def get_active_users_by_department(department: str) -> list:
     finally:
         if conn:
             conn.close()
+
 
 
 
