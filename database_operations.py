@@ -490,39 +490,101 @@ def add_manual_checkin_request(user_id: int, requested_checkin_time: datetime) -
         if conn:
             conn.close()
 
-def get_pending_manual_checkin_requests():
+def get_pending_manual_checkin_requests() -> list:
     """
-    Возвращает список ожидающих заявок на ручную отметку (статус 'pending'),
-    включая информацию о пользователе.
+    Возвращает список ожидающих ручных заявок, ОБЪЕДИНЕННЫЙ с данными пользователя (имя, департамент).
     """
     conn = None
-    requests_data = []
     try:
         conn = get_db_connection()
+        conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
-        cursor.execute("""
-            SELECT 
-                mcr.request_id, 
-                mcr.user_id, 
-                mcr.requested_checkin_time, -- Это время, как его ввел пользователь (предположительно, локальное)
-                mcr.request_timestamp,    -- Время создания заявки (локальное время сервера БД)
-                u.username,
+        
+        sql_query = """
+            SELECT
+                req.request_id,
+                req.user_id,
+                req.requested_checkin_time,
+                req.request_timestamp,
                 u.first_name,
                 u.last_name,
-                u.application_department -- Ключ сектора пользователя (например, "СС", "ВИ")
-            FROM manual_checkin_requests mcr
-            JOIN users u ON mcr.user_id = u.telegram_id
-            WHERE mcr.status = 'pending'
-            ORDER BY mcr.request_timestamp ASC
-        """)
-        requests_data = cursor.fetchall() # fetchall() возвращает список sqlite3.Row объектов
-        logger.info(f"DB: Найдено {len(requests_data)} ожидающих заявок на ручную отметку.")
+                u.username,
+                u.application_department
+            FROM manual_checkin_requests req
+            JOIN users u ON req.user_id = u.telegram_id
+            WHERE req.status = 'pending'
+            ORDER BY req.request_timestamp ASC
+        """
+        
+        cursor.execute(sql_query)
+        requests = cursor.fetchall()
+        logger.info(f"DB: Найдено {len(requests)} ожидающих заявок на ручную отметку.")
+        return requests
+        
     except sqlite3.Error as e:
-        logger.error(f"DB_ERROR: Ошибка при получении списка ожидающих ручных заявок: {e}", exc_info=True)
+        logger.error(f"DB_ERROR: Ошибка при получении списка ручных заявок: {e}", exc_info=True)
+        return []
     finally:
         if conn:
             conn.close()
-    return requests_data
+
+
+def approve_all_pending_manual_checkins() -> tuple[int, int]:
+    """
+    Одобряет все ожидающие ручные заявки в рамках одной транзакции.
+    """
+    conn = None
+    approved_count = 0
+    failed_count = 0
+    total_requests = 0
+    
+    try:
+        conn = get_db_connection()
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        pending_requests = get_pending_manual_checkin_requests() 
+        
+        if not pending_requests:
+            return (0, 0)
+
+        total_requests = len(pending_requests)
+
+        for req in pending_requests:
+            try:
+                # Шаг 1: Добавляем рабочую сессию
+                cursor.execute(
+                    "INSERT INTO work_sessions (telegram_id, check_in_time) VALUES (?, ?)",
+                    (req['user_id'], req['requested_checkin_time'])
+                )
+                
+                # --- ГЛАВНОЕ ИСПРАВЛЕНИЕ: УБИРАЕМ processed_by ---
+                # Шаг 2: Обновляем статус заявки
+                cursor.execute(
+                    "UPDATE manual_checkin_requests SET status = 'approved' WHERE request_id = ?",
+                    (req['request_id'],)
+                )
+                
+                approved_count += 1
+            except sqlite3.Error as e:
+                logger.error(f"DB_ERROR: Ошибка при массовом одобрении заявки {req['request_id']}: {e}", exc_info=True)
+                failed_count += 1
+        
+        conn.commit()
+        logger.info(f"DB: Массовое одобрение завершено. Успешно: {approved_count}, Ошибки: {failed_count}.")
+        return (approved_count, failed_count)
+
+    except sqlite3.Error as e:
+        logger.error(f"DB_ERROR: Критическая ошибка в approve_all_pending_manual_checkins: {e}", exc_info=True)
+        if conn:
+            conn.rollback() 
+        return (0, total_requests)
+    finally:
+        if conn:
+            conn.close()
+
+
+
 
 def get_manual_checkin_request_by_id(request_id: int):
     """
@@ -668,6 +730,77 @@ def reject_manual_checkin_request(request_id: int, admin_id: int) -> bool:
     finally:
         if conn:
             conn.close()
+
+
+def get_unique_user_departments() -> list:
+    """
+    Возвращает отсортированный список уникальных департаментов из таблицы users.
+    """
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        # ИСПОЛЬЗУЕМ ПРАВИЛЬНОЕ ИМЯ КОЛОНКИ: application_department
+        cursor.execute("SELECT DISTINCT application_department FROM users WHERE application_department IS NOT NULL AND application_department != '' ORDER BY application_department ASC")
+        return [row[0] for row in cursor.fetchall()]
+    except sqlite3.Error as e:
+        logger.error(f"DB_ERROR: Ошибка при получении списка уникальных департаментов: {e}", exc_info=True)
+        return []
+    finally:
+        if conn:
+            conn.close()
+
+
+
+def get_active_users_by_department(department: str) -> list:
+    """
+    Возвращает УНИКАЛЬНЫЙ список пользователей с их САМОЙ ПОСЛЕДНЕЙ активной сессией.
+    Использует application_full_name для ФИО.
+    """
+    conn = None
+    try:
+        conn = get_db_connection()
+        conn.row_factory = sqlite3.Row 
+        cursor = conn.cursor()
+
+        sql_query = """
+            SELECT
+                u.application_full_name, -- <--- ГЛАВНОЕ ИЗМЕНЕНИЕ
+                u.username,
+                u.application_department,
+                t.max_check_in_time AS check_in_time
+            FROM (
+                SELECT
+                    telegram_id,
+                    MAX(check_in_time) AS max_check_in_time
+                FROM work_sessions
+                WHERE check_out_time IS NULL
+                GROUP BY telegram_id
+            ) AS t
+            JOIN users u ON t.telegram_id = u.telegram_id
+            WHERE
+                (? = 'ALL' OR u.application_department = ?)
+            ORDER BY
+                u.application_department, max_check_in_time ASC;
+        """
+        
+        cursor.execute(sql_query, (department, department))
+        results = cursor.fetchall()
+        logger.info(f"DB_INFO: Умный запрос вернул {len(results)} уникальных строк.")
+        return results
+
+    except sqlite3.Error as e:
+        logger.error(f"DB_ERROR: Ошибка при получении активных пользователей для департамента '{department}': {e}", exc_info=True)
+        return []
+    finally:
+        if conn:
+            conn.close()
+
+
+
+
+
+
 
 
 

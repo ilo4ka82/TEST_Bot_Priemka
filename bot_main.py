@@ -5,6 +5,8 @@ import math
 import io
 import pandas as pd
 from datetime import datetime, timedelta, date
+from datetime import timezone 
+from zoneinfo import ZoneInfo
 from typing import Union, Dict 
 import telegram
 from telegram import Update, KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove, BotCommand, BotCommandScopeChat, InlineKeyboardMarkup, InlineKeyboardButton
@@ -12,6 +14,7 @@ from telegram.constants import ParseMode
 from telegram import Update, User, Bot
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler, ConversationHandler
 from openpyxl.styles import Font
+import config
 from config import TELEGRAM_BOT_TOKEN, ADMIN_TELEGRAM_IDS, THE_OFFICE_ZONE, ITEMS_PER_PAGE, SECTOR_WEEKLY_NORMS 
 from telegram_bot_calendar import DetailedTelegramCalendar, LSTEP 
 from telegram.ext.filters import BaseFilter
@@ -23,6 +26,16 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+def is_admin(user_id: int) -> bool:
+    """
+    Проверяет, является ли пользователь администратором,
+    сравнивая его ID со списком из файла конфигурации.
+    """
+    return user_id in config.ADMIN_TELEGRAM_IDS
+
+utc = timezone.utc
+MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 
 # Состояния для ConversationHandler экспорта
 EXPORT_CONV_START_STATE = 10 
@@ -119,59 +132,101 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text(text_to_send, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN_V2)
 
 
-# Этот обработчик сработает на команду /on_shift, но только для админов
 async def on_shift_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # Я предполагаю, что у тебя в конфиге есть словарь с нормами по секторам
-    # Если нет, можно просто захардкодить список: sectors = ['СС', 'ПЛ', 'Другой']
-    sectors = list(config.SECTOR_WEEKLY_NORMS.keys())
-    if "DEFAULT_NORM" in sectors:
-        sectors.remove("DEFAULT_NORM")
+    """
+    Начинает диалог просмотра сотрудников на смене.
+    Показывает кнопки с департаментами, существующими в базе.
+    """
+    logger.info(f"Админ {update.effective_user.id} вызвал команду /on_shift")
+    
+    # ИСПРАВЛЕНИЕ: Вызываем функцию с правильным именем 'get_unique_user_departments'
+    departments = db.get_unique_user_departments()
+    
+    if not departments:
+        await update.message.reply_text("В базе данных не найдено пользователей с указанными департаментами.")
+        return
+
 
     keyboard = []
-    # Создаем кнопки в несколько рядов, по 2 в каждом
-    row = []
-    for sector in sectors:
-        # Важно: callback_data должен быть строкой. Создаем уникальный префикс 'on_shift_sector:'
-        row.append(InlineKeyboardButton(sector, callback_data=f"on_shift_sector:{sector}"))
-        if len(row) == 2:
-            keyboard.append(row)
-            row = []
-    if row:
-        keyboard.append(row)
-
+    for department_name in departments:
+        keyboard.append([
+            InlineKeyboardButton(f"Департамент: {department_name}", callback_data=f"on_shift_dept:{department_name}")
+        ])
+    
+    keyboard.append([InlineKeyboardButton("Показать всех", callback_data="on_shift_dept:ALL")])
+    keyboard.append([InlineKeyboardButton("Отмена", callback_data="on_shift_cancel")])
+    
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("Выберите сектор, чтобы посмотреть, кто на работе:", reply_markup=reply_markup)
+    await update.message.reply_text("Выберите департамент для просмотра:", reply_markup=reply_markup)
 
 # Этот обработчик будет ловить нажатия на кнопки с секторами
 async def on_shift_button_press(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Обрабатывает нажатие на кнопку, форматирует вывод в виде таблицы
+    с выравниванием по правому краю для времени.
+    """
     query = update.callback_query
-    await query.answer() # Обязательно, чтобы убрать "часики" на кнопке
+    await query.answer()
 
-    # Разбираем callback_data, чтобы получить сектор
-    # callback_data будет вида "on_shift_sector:СС"
     try:
-        prefix, sector = query.data.split(':', 1)
-        if prefix != 'on_shift_sector':
-             return # Это не наш колбэк, игнорируем
-    except (ValueError, IndexError):
-        return # Неправильный формат колбэка
+        command, _, department_choice = query.data.partition(':')
 
-    # Вызываем нашу новую функцию из database.py
-    users_on_shift = db.get_users_on_shift_by_sector(sector)
+        if command == "on_shift_cancel":
+            await query.edit_message_text("Действие отменено.")
+            return
+            
+        logger.info(f"Админ {query.from_user.id} запросил список на смене для департамента: {department_choice}")
 
-    if not users_on_shift:
-        response_text = f"В секторе <b>{sector}</b> сейчас никого нет на смене."
-    else:
-        response_text = f"<b>Сотрудники на смене в секторе {sector}:</b>\n\n"
-        for user_name, check_in_time in users_on_shift:
-            # Преобразуем время в удобный формат
-            check_in_dt = datetime.fromisoformat(check_in_time)
-            # Убедись, что datetime импортирован: from datetime import datetime
-            formatted_time = check_in_dt.strftime('%H:%M:%S')
-            response_text += f"• {user_name} (пришел в {formatted_time})\n"
-    
-    # Редактируем исходное сообщение с кнопками, заменяя его на результат
-    await query.edit_message_text(text=response_text, parse_mode=ParseMode.HTML)
+        active_users = db.get_active_users_by_department(department_choice)
+
+        display_header = "Все" if department_choice == "ALL" else department_choice
+        message_text = f"<b>👥 Сотрудники на смене (Департамент: {display_header})</b>\n"
+
+        if not active_users:
+            message_text += "\nНа смене никого нет."
+            await query.edit_message_text(text=message_text, parse_mode=ParseMode.HTML)
+            return
+
+        formatted_lines = {}
+        
+        for user in active_users:
+            # --- ГЛАВНОЕ ИЗМЕНЕНИЕ: ИСПОЛЬЗУЕМ application_full_name ---
+            # Приоритет - полное имя. Если его нет, то никнейм.
+            display_name = user['application_full_name'] or user['username'] or 'Без имени'
+
+            try:
+                checkin_dt = datetime.strptime(user['check_in_time'], '%Y-%m-%d %H:%M:%S')
+                checkin_time_str = checkin_dt.strftime('%H:%M')
+            except (ValueError, TypeError):
+                checkin_time_str = "??:??"
+            
+            department = user['application_department'] or "Без департамента"
+            
+            if department not in formatted_lines:
+                formatted_lines[department] = []
+            formatted_lines[department].append({'name': display_name, 'time': checkin_time_str})
+
+        max_name_length = 0
+        for dept_lines in formatted_lines.values():
+            for line in dept_lines:
+                if len(line['name']) > max_name_length:
+                    max_name_length = len(line['name'])
+        
+        for department, employees in sorted(formatted_lines.items()):
+            message_text += f"\n<b>{department}:</b>\n"
+            
+            table_rows = []
+            for emp in employees:
+                aligned_name = emp['name'].ljust(max_name_length)
+                table_rows.append(f"<code>{aligned_name}  |  {emp['time']}</code>")
+            
+            message_text += "\n".join(table_rows)
+            
+        await query.edit_message_text(text=message_text, parse_mode=ParseMode.HTML)
+
+    except Exception as e:
+        logger.error(f"Критическая ошибка в on_shift_button_press: {e}", exc_info=True)
+        await query.edit_message_text("Произошла внутренняя ошибка при формировании списка. Пожалуйста, проверьте логи.")
 
 
 
@@ -753,110 +808,88 @@ async def notify_admins_new_manual_request(bot: Bot, requesting_user: User, requ
 
 
 async def admin_manual_checkins_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    user = update.effective_user
-    logger.info(f"Вызвана функция admin_manual_checkins_start админом {user.id}")
-
-    if user.id not in ADMIN_TELEGRAM_IDS:
-        logger.warning(f"Попытка доступа к admin_manual_checkins от НЕ-админа {user.id}")
-        await update.message.reply_text("Эта команда доступна только администраторам.")
-        return ConversationHandler.END
-
-    logger.info(f"Администратор {user.id} ({user.username or 'N/A'}) запросил список ручных заявок (/admin_manual_checkins).")
+    admin_user = update.effective_user
+    logger.info(f"Вызвана функция admin_manual_checkins_start админом {admin_user.id}")
     
-    try:
-        pending_requests = db.get_pending_manual_checkin_requests()
-
-        logger.info(f"База данных вернула {len(pending_requests)} заявок. Тип данных: {type(pending_requests)}")
-        if pending_requests:
-             logger.info(f"Структура первой заявки: {pending_requests[0]}. Тип: {type(pending_requests[0])}")
-
-        if not pending_requests:
-            logger.info("Нет ожидающих заявок. Завершаем диалог.")
-            await update.message.reply_text("В настоящее время нет ожидающих заявок на ручную отметку.")
-            return ConversationHandler.END
-
-        message_text = "Ожидающие заявки на ручную отметку прихода:\n\n"
-        keyboard = []
-
-        logger.info("Начинаем обработку цикла для формирования списка заявок...")
-        for req_idx, req in enumerate(pending_requests):
-            logger.info(f"Обрабатывается заявка с индексом {req_idx}, данные: {req}")
-            
-            user_first_name_val = req['first_name'] if 'first_name' in req.keys() else ''
-            user_last_name_val = req['last_name'] if 'last_name' in req.keys() else ''
-            username_val = req['username'] if 'username' in req.keys() else None
-            user_id_val = req['user_id']
-            request_id_val = req['request_id']
-            requested_checkin_time_val = req['requested_checkin_time']
-            application_department_val = req['application_department']
-
-            user_full_name = f"{user_first_name_val or ''} {user_last_name_val or ''}".strip()
-            
-            if user_full_name:
-                user_display = user_full_name
-                if username_val:
-                    user_display += f" (@{username_val})"
-            elif username_val:
-                user_display = f"@{username_val}"
-            else:
-                user_display = f"ID: {user_id_val}"
-            
-            escaped_user_display = escape_markdown_v2(user_display)
-
-            try:
-                requested_time_dt = datetime.strptime(requested_checkin_time_val, '%Y-%m-%d %H:%M:%S')
-                requested_time_display = requested_time_dt.strftime('%d.%m.%Y %H:%M')
-            except (ValueError, TypeError):
-                requested_time_display = requested_checkin_time_val
-            
-            escaped_requested_time_display = escape_markdown_v2(requested_time_display)
-
-            department_key = application_department_val
-            department_display = department_key
-            escaped_department_display = escape_markdown_v2(department_display)
-
-            message_text += (
-                f"🔹 **Заявка ID: {request_id_val}**\n"
-                f"   Пользователь: {escaped_user_display}\n"
-                f"   Сектор: {escaped_department_display}\n"
-                f"   Запрошено время: *{escaped_requested_time_display}*\n\n"
-            )
-            
-            button_text_user_part = user_display 
-            if len(button_text_user_part) > 20:
-                 button_text_user_part = button_text_user_part[:17] + "..."
-
-            keyboard.append([
-                InlineKeyboardButton(
-                    f"Рассмотреть ID: {request_id_val} от {button_text_user_part}", 
-                    callback_data=f"admin_process_req_{request_id_val}"
-                )
-            ])
-        
-        logger.info("Цикл завершен. Готовимся к отправке сообщения админу.")
-        
-        keyboard.append([InlineKeyboardButton("Отмена", callback_data="admin_cancel_manual_dialog")])
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
-        try:
-            await update.message.reply_text(message_text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN_V2)
-            logger.info("Сообщение со списком заявок успешно отправлено.")
-        except telegram.error.BadRequest as e: 
-            logger.error(f"Ошибка BadRequest при отправке списка ручных заявок: {e}. Текст: {message_text}")
-            await update.message.reply_text(
-                "Не удалось отобразить список заявок с форматированием\\. Пожалуйста, попробуйте позже или обратитесь к администратору\\.\n"
-                "Возможно, в именах пользователей или других данных есть символы, мешающие отображению\\.",
-                reply_markup=reply_markup
-            )
-        
-        return ADMIN_LIST_MANUAL_REQUESTS
-
-    except Exception as e:
-        logger.exception("КРИТИЧЕСКАЯ ОШИБКА в admin_manual_checkins_start:")
-        await update.message.reply_text("Произошла непредвиденная ошибка при получении списка заявок. Обратитесь к разработчику.")
+    if not is_admin(admin_user.id):
+        await update.message.reply_text("Эта команда доступна только для администраторов.")
         return ConversationHandler.END
 
- 
+    logger.info(f"Администратор {admin_user.id} ({admin_user.username}) запросил список ручных заявок (/admin_manual_checkins).")
+
+    pending_requests = db.get_pending_manual_checkin_requests()
+    
+    if not pending_requests:
+        await update.message.reply_text("На данный момент нет ожидающих заявок на ручную отметку.")
+        return ConversationHandler.END
+
+    message_text = "<b>Ожидающие заявки на ручную отметку:</b>\n\n"
+    keyboard = []
+
+    for i, req in enumerate(pending_requests):
+        try:
+            req_time_utc = datetime.strptime(req['requested_checkin_time'], '%Y-%m-%d %H:%M:%S').replace(tzinfo=utc)
+            req_time_local = req_time_utc.astimezone(MOSCOW_TZ)
+            formatted_time = req_time_local.strftime('%Y-%m-%d %H:%M:%S')
+        except (ValueError, TypeError):
+            formatted_time = req['requested_checkin_time']
+        
+        department = req['application_department'] or 'Не указан'
+        user_info = f"{req['first_name'] or ''} {req['last_name'] or ''} (@{req['username'] or 'N/A'})"
+        
+        message_text += f"<b>{i+1}. {user_info}</b>\n"
+        message_text += f"   - <b>Сектор:</b> {department}\n"
+        message_text += f"   - <b>Время:</b> {formatted_time}\n\n"
+
+        keyboard.append([
+            InlineKeyboardButton(f"Рассмотреть заявку №{i+1}", callback_data=f"admin_process_req_{req['request_id']}")
+        ])
+
+    keyboard.append([InlineKeyboardButton("✅ Принять все", callback_data="admin_approve_all")])
+    keyboard.append([InlineKeyboardButton("Отмена", callback_data="admin_cancel_manual_dialog")])
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await update.message.reply_text(
+        message_text,
+        reply_markup=reply_markup,
+        parse_mode=ParseMode.HTML
+    )
+    
+    return ADMIN_LIST_MANUAL_REQUESTS
+
+
+
+async def approve_all_requests_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """
+    Обрабатывает нажатие на кнопку "Принять все".
+    """
+    query = update.callback_query
+    await query.answer() # Убираем "часики"
+
+
+    admin_user = query.from_user
+    logger.info(f"Админ {admin_user.id} нажал на кнопку 'Принять все'.")
+
+
+    # Вызываем нашу новую функцию из database.py
+    approved_count, failed_count = db.approve_all_pending_manual_checkins()
+
+
+    if approved_count == 0 and failed_count == 0:
+        response_text = "Не найдено заявок для обработки."
+    else:
+        response_text = f"✅ Массовое одобрение завершено!\n\n" \
+                        f"Успешно обработано: {approved_count} шт.\n" \
+                        f"Пропущено из-за ошибок: {failed_count} шт."
+
+
+    # Редактируем исходное сообщение, убирая клавиатуру
+    await query.edit_message_text(text=response_text)
+
+
+    # Завершаем диалог
+    return ConversationHandler.END
 
 
 async def admin_select_manual_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -2679,7 +2712,7 @@ async def set_bot_commands(application: Application):
     # Команды только для админов (добавляются к common и authorized)
     admin_specific_commands = [
         BotCommand("admin_authorize", "👑 Авторизовать пользователя"),
-        #BotCommand("on_shift", "Посмотреть, кто на смене"),
+        BotCommand("on_shift", "Посмотреть, кто на смене"),
         BotCommand("admin_pending_users", "⏳ Заявки на доступ"),
         BotCommand("admin_export_attendance", "📊 Экспорт отчета о посещаемости"),
         BotCommand("admin_manual_checkins", "🛠️ Ручные заявки на приход"),
@@ -2781,6 +2814,9 @@ def main() -> None:
         states={
             ADMIN_LIST_MANUAL_REQUESTS: [
                 CallbackQueryHandler(admin_select_manual_request, pattern="^admin_process_req_"),
+                        
+                CallbackQueryHandler(approve_all_requests_callback, pattern="^admin_approve_all$"),
+
                 CallbackQueryHandler(admin_cancel_manual_checkins_dialog, pattern="^admin_cancel_manual_dialog$") 
             ],
             ADMIN_PROCESS_SINGLE_REQUEST: [
@@ -2795,6 +2831,9 @@ def main() -> None:
         },
         fallbacks=[
             CommandHandler("admin_cancel_manual_checkins", admin_cancel_manual_checkins_dialog),
+            # Кстати, сюда было бы логично перенести и CallbackQueryHandler для отмены,
+            # чтобы он работал из любого состояния диалога, а не только из первого.
+            # CallbackQueryHandler(admin_cancel_manual_checkins_dialog, pattern="^admin_cancel_manual_dialog$")
         ],
         name="admin_manual_checkins_flow",
         per_user=True, 
@@ -2803,10 +2842,10 @@ def main() -> None:
     
     # === Регистрация ВСЕХ обработчиков ===
     # Сначала добавляем ConversationHandlers
+    application.add_handler(admin_manual_checkins_conv_handler) 
     application.add_handler(application_conv_handler)
     application.add_handler(export_conv_handler)
     application.add_handler(manual_checkin_conv_handler) 
-    application.add_handler(admin_manual_checkins_conv_handler) 
 
     # Затем остальные обработчики
     application.add_handler(CommandHandler("start", start_command))
@@ -2817,8 +2856,7 @@ def main() -> None:
     application.add_handler(CommandHandler("on_shift", on_shift_command, filters=AdminFilter()))
     application.add_handler(CommandHandler("admin_authorize", admin_authorize_command))
     application.add_handler(CommandHandler("admin_pending_users", admin_pending_users_command))
-    application.add_handler(CommandHandler("on_shift", on_shift_command, filters=AdminFilter()))
-    application.add_handler(CallbackQueryHandler(on_shift_button_press, pattern="^on_shift_sector:"))
+    application.add_handler(CallbackQueryHandler(on_shift_button_press, pattern=r"^on_shift_"))
     
     application.add_handler(MessageHandler(filters.LOCATION, location_handler))
     
