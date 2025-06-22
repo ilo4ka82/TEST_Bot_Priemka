@@ -1596,14 +1596,14 @@ async def process_export_start_date(update: Update, context: ContextTypes.DEFAUL
         return ConversationHandler.END
     await query.answer()
     
-    # Границы для календаря (должны совпадать с ask_export_start_date)
+    # ТВОЙ НАДЕЖНЫЙ БЛОК TRY...EXCEPT - ОСТАВЛЯЕМ!
     try:
         min_cal_date = date(2023, 1, 1) 
         max_cal_date = date.today()
-    except NameError: # Если 'date' все еще не импортирован правильно
-        logger.error("Имя 'date' не определено в process_export_start_date. Убедитесь, что 'from datetime import date' есть в импортах.")
+    except NameError:
+        logger.error("Имя 'date' не определено. Убедитесь, что 'from datetime import date, datetime' есть в импортах.")
         await query.edit_message_text("Внутренняя ошибка конфигурации даты. Свяжитесь с администратором.")
-        return ConversationHandler.END # Безопасное завершение
+        return ConversationHandler.END
     
     result, key, step = DetailedTelegramCalendar(
         locale='ru', min_date=min_cal_date, max_date=max_cal_date
@@ -1613,11 +1613,13 @@ async def process_export_start_date(update: Update, context: ContextTypes.DEFAUL
         logger.info("process_export_start_date: Навигация по календарю начальной даты.")
         await query.edit_message_text("🗓️ Шаг 2.1: Выберите НАЧАЛЬНУЮ дату для отчета:", reply_markup=key)
         return GET_EXPORT_START_DATE
-    elif result: # Дата выбрана (result - это объект datetime.date)
-        context.user_data['export_start_date'] = result 
-        logger.info(f"Админ {query.from_user.id} выбрал начальную дату (календарь): {result.strftime('%d.%m.%Y')}")
+    elif result: # Дата выбрана
+        # МОЙ ФИКС ВРЕМЕНИ
+        start_datetime = datetime.combine(result, datetime.min.time())
+        context.user_data['export_start_date'] = start_datetime
+        logger.info(f"Админ {query.from_user.id} выбрал начальную дату: {start_datetime.strftime('%d.%m.%Y %H:%M')}")
         
-        # Запрос конечной даты
+        # ТВОЯ ЛОГИКА ЗАПРОСА КОНЕЧНОЙ ДАТЫ - ОСТАВЛЯЕМ!
         end_min_date = result 
         end_max_date = date.today()
         if end_max_date < end_min_date:
@@ -1633,11 +1635,13 @@ async def process_export_start_date(update: Update, context: ContextTypes.DEFAUL
         )
         return GET_EXPORT_END_DATE
     
+    # ТВОЯ НАДЕЖНАЯ ОБРАБОТКА ОШИБКИ В КОНЦЕ - ОСТАВЛЯЕМ!
     logger.warning(f"process_export_start_date: дата не выбрана и нет ключа навигации (result={result}, key={key}). Callback: {query.data}")
     await query.edit_message_text(
         "Ошибка при выборе начальной даты. Попробуйте снова или отмените экспорт (/cancel_export)."
     )
     return GET_EXPORT_START_DATE
+
 
 async def process_export_end_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """
@@ -1651,66 +1655,70 @@ async def process_export_end_date(update: Update, context: ContextTypes.DEFAULT_
         return ConversationHandler.END
     await query.answer()
     
-    start_date_obj = context.user_data.get('export_start_date') # Должен быть datetime.date [[3]]
-
-    if not start_date_obj or not isinstance(start_date_obj, date): # [[2]]
-        logger.error(f"Админ {query.from_user.id}: начальная дата не найдена или неверного типа ({type(start_date_obj)}) в process_export_end_date.")
+    # --- ТВОЯ НАДЕЖНАЯ ПРОВЕРКА ---
+    # Мы ожидаем, что start_date теперь это datetime объект
+    start_datetime_obj = context.user_data.get('export_start_date') 
+    if not start_datetime_obj or not isinstance(start_datetime_obj, datetime):
+        logger.error(f"Админ {query.from_user.id}: начальная дата (datetime) не найдена или неверного типа.")
         await query.edit_message_text("Ошибка: начальная дата не найдена. Начните выбор периода заново.")
-        # Упрощаем вызов, так как ask_export_period теперь должна быть определена
         return await ask_export_period(update, context)
 
-    # Предполагаем, что 'from datetime import date' есть в импортах,
-    # поэтому try-except NameError для date.today() можно убрать, если уверены в импорте.
-    # Оставим для дополнительной безопасности, если есть сомнения.
+    # Для логики календаря нам нужна "голая" дата, без времени
+    start_date_for_calendar = start_datetime_obj.date()
+
+    # --- ТВОЯ НАДЕЖНАЯ ПРОВЕРКА ГРАНИЦ ---
     try:
-        end_min_date = start_date_obj
-        end_max_date = date.today() # [[3]]
+        end_min_date = start_date_for_calendar
+        end_max_date = date.today()
         if end_max_date < end_min_date: 
              end_max_date = end_min_date
     except NameError: 
-        logger.critical("Имя 'date' не определено в process_export_end_date. КРИТИЧЕСКАЯ ОШИБКА ИМПОРТА: 'from datetime import date' отсутствует или не работает.")
-        await query.edit_message_text("Критическая внутренняя ошибка конфигурации даты. Свяжитесь с администратором.")
+        logger.critical("Имя 'date' не определено. Убедитесь в правильности импорта 'from datetime import date, datetime'.")
+        await query.edit_message_text("Критическая внутренняя ошибка конфигурации даты.")
         return ConversationHandler.END 
          
-    # [[4]]
     result, key, step = DetailedTelegramCalendar(
         locale='ru', min_date=end_min_date, max_date=end_max_date
     ).process(query.data)
 
     if not result and key: # Навигация по календарю
-        logger.info("process_export_end_date: Навигация по календарю конечной даты.")
         await query.edit_message_text(
-            f"Начальная дата: {start_date_obj.strftime('%d.%m.%Y')}\n"
-            "🗓️ Шаг 2.2: Теперь выберите КОНЕЧНУЮ дату для отчета:", # [[1]]
+            f"Начальная дата: {start_date_for_calendar.strftime('%d.%m.%Y')}\n"
+            "🗓️ Шаг 2.2: Теперь выберите КОНЕЧНУЮ дату для отчета:",
             reply_markup=key
         )
         return GET_EXPORT_END_DATE
-    elif result: # Дата выбрана (result - это объект datetime.date)
+    elif result: # Дата выбрана
         end_date_obj = result
-        if end_date_obj < start_date_obj:
-            logger.info(f"Админ {query.from_user.id}: конечная дата ({end_date_obj.strftime('%d.%m.%Y')}) раньше начальной ({start_date_obj.strftime('%d.%m.%Y')}). Запрос повторно.")
-            calendar_end_retry, step_end_retry = DetailedTelegramCalendar(locale='ru', min_date=start_date_obj, max_date=end_max_date).build()
+        # --- ТВОЯ ПРОВЕРКА, ЧТО КОНЕЧНАЯ ДАТА НЕ РАНЬШЕ НАЧАЛЬНОЙ ---
+        if end_date_obj < start_date_for_calendar:
+            logger.info(f"Админ {query.from_user.id}: конечная дата раньше начальной. Запрос повторно.")
+            calendar_end_retry, _ = DetailedTelegramCalendar(locale='ru', min_date=start_date_for_calendar, max_date=end_max_date).build()
             await query.edit_message_text(
-                f"Начальная дата: {start_date_obj.strftime('%d.%m.%Y')}\n"
+                f"Начальная дата: {start_date_for_calendar.strftime('%d.%m.%Y')}\n"
                 f"⚠️ Конечная дата не может быть раньше начальной. Выберите КОНЕЧНУЮ дату еще раз:",
                 reply_markup=calendar_end_retry
             )
             return GET_EXPORT_END_DATE
 
-        context.user_data['export_end_date'] = end_date_obj
-        logger.info(f"Админ {query.from_user.id} выбрал конечную дату (календарь): {end_date_obj.strftime('%d.%m.%Y')}")
+        # --- МОЙ ФИКС ВРЕМЕНИ (КОНЕЦ ДНЯ) ---
+        end_datetime = datetime.combine(end_date_obj, datetime.max.time())
+        context.user_data['export_end_date'] = end_datetime
+        logger.info(f"Админ {query.from_user.id} выбрал конечную дату: {end_datetime.strftime('%d.%m.%Y %H:%M:%S')}")
         
+        # --- ТВОЯ ЛОГИКА СОХРАНЕНИЯ ДАННЫХ ---
         context.user_data['selected_period_type'] = 'custom' 
-        context.user_data['export_period_display_text'] = f"с {start_date_obj.strftime('%d.%m.%Y')} по {end_date_obj.strftime('%d.%m.%Y')}"
+        context.user_data['export_period_display_text'] = f"с {start_date_for_calendar.strftime('%d.%m.%Y')} по {end_date_obj.strftime('%d.%m.%Y')}"
         
-        # Упрощаем вызов, так как show_export_confirmation теперь должна быть определена
         return await show_export_confirmation(update, context)
     
-    logger.warning(f"process_export_end_date: дата не выбрана и нет ключа навигации (result={result}, key={key}). Callback: {query.data}")
+    # --- ТВОЯ ОБРАБОТКА ОШИБКИ В КОНЦЕ ---
+    logger.warning(f"process_export_end_date: дата не выбрана и нет ключа навигации. Callback: {query.data}")
     await query.edit_message_text(
-        "Ошибка при выборе конечной даты. Попробуйте снова или отмените экспорт (/cancel_export)."
+        "Ошибка при выборе конечной даты. Попробуйте снова или отмените экспорт."
     )
     return GET_EXPORT_END_DATE
+
 
 
 
