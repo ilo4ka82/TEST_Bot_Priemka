@@ -1160,7 +1160,7 @@ async def admin_confirm_decision_prompt(update: Update, context: ContextTypes.DE
     admin_action = context.user_data.get('admin_action')
 
     if not user_request_data or not admin_action:
-        error_message = "Ошибка: данные для подтверждения не найдены\\.\nПожалуйста, начните сначала командой /admin_manual_checkins\\." # Экранированы точки
+        error_message = "Ошибка: данные для подтверждения не найдены\\.\nПожалуйста, начните сначала командой /admin_manual_checkins\\." 
         if query:
             await query.edit_message_text(text=error_message, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=None)
         elif hasattr(update, 'message') and update.message: 
@@ -1901,27 +1901,27 @@ async def select_period_callback(update: Update, context: ContextTypes.DEFAULT_T
 
 # Вспомогательная функция для форматирования секунд в ЧЧ:ММ:СС
 def format_seconds_to_hhmmss(seconds_val):
+    # Если на входе некорректные данные (например, сессия еще не закрыта),
+    # возвращаем "Активна", что гораздо понятнее, чем "00:00:00".
     if pd.isna(seconds_val) or not isinstance(seconds_val, (int, float)) or seconds_val < 0:
-        return "00:00:00" 
+        return "Активна" 
+    
     seconds_val = int(seconds_val)
     hours = seconds_val // 3600
     minutes = (seconds_val % 3600) // 60
     secs = seconds_val % 60
+    
+    # f-строка с :02d - это то же самое, что :02
     return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
 
 async def generate_custom_excel_report(report_data: list, report_info: dict, selected_sector_key: str) -> bytes:
     """
-    Генерирует Excel-отчет. Если выбран "Все секторы", каждый сектор на отдельном листе.
-
-    Args:
-        report_data (list): Список словарей с данными о сессиях.
-        report_info (dict): Словарь с информацией об отчете.
-        selected_sector_key (str): Ключ выбранного сектора ("ALL" или конкретный ключ, например "СС").
-
-    Returns:
-        bytes: Байты сгенерированного Excel-файла.
+    Генерирует Excel-отчет, САМОСТОЯТЕЛЬНО ВЫЧИСЛЯЯ длительность сессий
+    и ДОБАВЛЯЯ ОТСТУПЫ между сотрудниками.
     """
     if not report_data:
+        # ... (эта часть остается без изменений)
         logger.info("Нет данных для генерации Excel отчета.")
         df_empty = pd.DataFrame([{"Сообщение": "Нет данных для отображения в выбранных параметрах"}])
         output = io.BytesIO()
@@ -1930,26 +1930,19 @@ async def generate_custom_excel_report(report_data: list, report_info: dict, sel
         return output.getvalue()
 
     df_all_data = pd.DataFrame(report_data)
-    logger.info(f"Создан DataFrame для Excel. Shape: {df_all_data.shape}. Колонки: {df_all_data.columns.tolist()}")
-
     output = io.BytesIO()
+
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        # Общая логика подготовки данных для одного листа
-        def prepare_and_write_sheet(df_sheet_data, sheet_name_param): # Переименовал параметр во избежание путаницы
-            current_sheet_name = sheet_name_param # Используем переданное имя листа
+        def prepare_and_write_sheet(df_sheet_data, sheet_name_param):
             if df_sheet_data.empty:
-                logger.info(f"Нет данных для листа '{current_sheet_name}'. Лист не будет создан или будет пустым.")
                 return
 
             df_details = df_sheet_data.copy()
 
-            if 'duration_minutes' in df_details.columns:
-                df_details['duration_seconds_calculated'] = df_details['duration_minutes'].apply(
-                    lambda x: x * 60 if pd.notna(x) and isinstance(x, (int, float)) else None
-                )
-                df_details['Длительность сессии'] = df_details['duration_seconds_calculated'].apply(format_seconds_to_hhmmss)
-            else:
-                df_details['Длительность сессии'] = "N/A"
+            start_times = pd.to_datetime(df_details['session_start_time'], errors='coerce')
+            end_times = pd.to_datetime(df_details['session_end_time'], errors='coerce')
+            duration = end_times - start_times
+            df_details['Длительность сессии'] = duration.dt.total_seconds().apply(format_seconds_to_hhmmss)
             
             df_details.rename(columns={
                 'application_full_name': 'ФИО',
@@ -1958,19 +1951,41 @@ async def generate_custom_excel_report(report_data: list, report_info: dict, sel
                 'session_start_time': 'Начало сессии',
                 'session_end_time': 'Конец сессии'
             }, inplace=True)
-
+            
             final_columns = ['ФИО', 'Telegram Username', 'Сектор', 'Начало сессии', 'Конец сессии', 'Длительность сессии']
             existing_columns = [col for col in final_columns if col in df_details.columns]
-            
-            if not all(col in existing_columns for col in ['ФИО', 'Начало сессии', 'Конец сессии']):
-                 logger.error(f"На листе '{current_sheet_name}' отсутствуют ключевые столбцы. Пропуск листа.")
-                 return
-
             df_sheet_final = df_details[existing_columns]
-            df_sheet_final.to_excel(writer, sheet_name=current_sheet_name, index=False)
+
+            # --- НАЧАЛО НОВОЙ ЛОГИКИ ОТСТУПОВ ---
             
-            worksheet = writer.book[current_sheet_name]   
+            # Убедимся, что данные отсортированы по ФИО, это ключ к успеху
+            df_sorted = df_sheet_final.sort_values(by='ФИО').reset_index(drop=True)
             
+            new_rows = []
+            last_name = None
+            
+            # Создаем шаблон для пустой строки, чтобы сохранить структуру колонок
+            blank_row = pd.Series([''] * len(df_sorted.columns), index=df_sorted.columns)
+
+            for index, row in df_sorted.iterrows():
+                current_name = row['ФИО']
+                # Если имя сменилось (и это не первая строка), добавляем пустую строку
+                if last_name is not None and current_name != last_name:
+                    new_rows.append(blank_row)
+                
+                new_rows.append(row) # Добавляем текущую строку с данными
+                last_name = current_name
+            
+            # Создаем новый DataFrame из списка, который теперь содержит пустые строки
+            df_with_spacing = pd.DataFrame(new_rows)
+            
+            # --- КОНЕЦ НОВОЙ ЛОГИКИ ОТСТУПОВ ---
+
+            # Записываем в Excel новый DataFrame с отступами
+            df_with_spacing.to_excel(writer, sheet_name=sheet_name_param, index=False)
+            
+            # ... (остальная часть функции по форматированию листа остается без изменений)
+            worksheet = writer.book[sheet_name_param]   
             for column_cells in worksheet.columns:
                 try:
                     max_length = 0
@@ -1983,46 +1998,31 @@ async def generate_custom_excel_report(report_data: list, report_info: dict, sel
                     adjusted_width = (max_length + 2) if max_length > 0 else 10
                     worksheet.column_dimensions[column_letter].width = adjusted_width
                 except Exception as e_width:
-                    logger.debug(f"Ошибка автоширины для столбца на листе '{current_sheet_name}': {e_width}")
-            logger.info(f"Лист '{current_sheet_name}' успешно добавлен в Excel.")
+                    logger.debug(f"Ошибка автоширины для столбца на листе '{sheet_name_param}': {e_width}")
+            logger.info(f"Лист '{sheet_name_param}' успешно добавлен в Excel.")
 
+        # ... (остальная часть функции по разделению на листы остается без изменений)
         if selected_sector_key.upper() == 'ALL':
             if 'application_department' not in df_all_data.columns:
                 logger.error("Столбец 'application_department' отсутствует в данных, не могу разделить по секторам.")
-                prepare_and_write_sheet(df_all_data, "Все_данные_ошибка_группировки") # Имя листа изменено для ясности
+                prepare_and_write_sheet(df_all_data, "Все_данные_ошибка_группировки")
             else:
-                # Нормализация имен департаментов для избежания проблем с регистром и создания уникальных имен листов
                 df_all_data['normalized_department_for_sheet'] = df_all_data['application_department'].astype(str).str.upper().fillna('Без_сектора')
-                
                 unique_departments_for_sheets = df_all_data['normalized_department_for_sheet'].unique()
-                logger.info(f"Обнаружены нормализованные секторы для отдельных листов: {unique_departments_for_sheets}")
-                
                 for dept_sheet_name_base in unique_departments_for_sheets:
-                    # Очистка имени листа от запрещенных символов и ограничение длины
-                    safe_sheet_name = "".join(c if c.isalnum() or c in " _-" else "_" for c in dept_sheet_name_base)
-                    safe_sheet_name = safe_sheet_name[:31] 
-
-                    # Фильтруем данные для текущего нормализованного департамента
+                    safe_sheet_name = "".join(c if c.isalnum() or c in " _-" else "_" for c in dept_sheet_name_base)[:31]
                     df_dept_data = df_all_data[df_all_data['normalized_department_for_sheet'] == dept_sheet_name_base]
-                    
-                    if df_dept_data.empty:
-                        logger.info(f"Нет данных для нормализованного сектора '{dept_sheet_name_base}' (лист '{safe_sheet_name}'). Лист не будет создан.")
-                        continue
-                    
-                    # Можно удалить временный столбец перед записью, если он не нужен в Excel
-                    # df_to_write = df_dept_data.drop(columns=['normalized_department_for_sheet'])
-                    # prepare_and_write_sheet(df_to_write, safe_sheet_name)
-                    prepare_and_write_sheet(df_dept_data.copy(), safe_sheet_name) # Передаем копию, чтобы избежать SettingWithCopyWarning
-
+                    if not df_dept_data.empty:
+                        prepare_and_write_sheet(df_dept_data.copy(), safe_sheet_name)
         else:
-            # Если выбран конкретный сектор
             sheet_name_base = report_info.get('sector_display_name', 'Детализация').replace(' ', '_')
-            safe_sheet_name = "".join(c if c.isalnum() or c in " _-" else "_" for c in sheet_name_base)
-            safe_sheet_name = safe_sheet_name[:31]
+            safe_sheet_name = "".join(c if c.isalnum() or c in " _-" else "_" for c in sheet_name_base)[:31]
             prepare_and_write_sheet(df_all_data, safe_sheet_name)
 
-    logger.info(f"Excel-файл сгенерирован в памяти.")
+    logger.info("Excel-файл сгенерирован в памяти.")
     return output.getvalue()
+
+
 
 
 
