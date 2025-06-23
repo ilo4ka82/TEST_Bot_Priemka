@@ -11,6 +11,8 @@ def get_db_connection():
     conn.row_factory = sqlite3.Row
     return conn
 
+MOSCOW_TZ = pytz_timezone('Europe/Moscow')
+
 
 # В файле database_operations.py
 def init_db():
