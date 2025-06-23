@@ -1,17 +1,20 @@
 import sqlite3
 import logging
-from datetime import datetime, timedelta
-from pytz import timezone as pytz_timezone, utc
+from datetime import datetime
+import pytz
+from pytz import utc
 from config import DATABASE_PATH
 
+
 logger = logging.getLogger(__name__)
+
+
+MOSCOW_TZ = pytz.timezone('Europe/Moscow')
 
 def get_db_connection():
     conn = sqlite3.connect(DATABASE_PATH)
     conn.row_factory = sqlite3.Row
     return conn
-
-MOSCOW_TZ = pytz_timezone('Europe/Moscow')
 
 
 # В файле database_operations.py
@@ -130,12 +133,24 @@ def add_or_update_user(telegram_id: int, username: str = None, first_name: str =
             conn.close()
 
 def get_user(telegram_id: int):
+    """
+    Получает пользователя по ID и возвращает его данные в виде СЛОВАРЯ.
+    """
     conn = get_db_connection()
     try:
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM users WHERE telegram_id = ?", (telegram_id,))
         user_row = cursor.fetchone()
-        return user_row
+        
+        # --- ВОТ ОНО, ГЛАВНОЕ ИСПРАВЛЕНИЕ ---
+        # Если пользователь найден (user_row не None),
+        # конвертируем специальный объект sqlite3.Row в обычный словарь.
+        if user_row:
+            return dict(user_row)
+        return None # Если пользователь не найден, возвращаем None
+        # ------------------------------------
+
+
     except sqlite3.Error as e:
         logger.error(f"Ошибка при получении пользователя {telegram_id}: {e}")
         return None
@@ -238,43 +253,53 @@ def record_check_in(user_id: int, latitude: float, longitude: float) -> tuple[bo
     """
     Записывает время прихода по геолокации.
     1. Проверяет, что нет других активных сессий.
-    2. Использует МОСКОВСКОЕ время.
+    2. ТЕПЕРЬ СОХРАНЯЕТ ВРЕМЯ В БАЗУ В ФОРМАТЕ UTC.
     3. Находит и записывает департамент пользователя (sector_id).
     """
     conn = None
     try:
         conn = get_db_connection()
-        conn.row_factory = sqlite3.Row # Позволяет обращаться к колонкам по имени
+        conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
 
-        # Шаг 1: Проверяем, нет ли у пользователя уже активной сессии
+
+        # Шаг 1: Проверка на активную сессию (без изменений)
         cursor.execute("SELECT session_id FROM work_sessions WHERE telegram_id = ? AND check_out_time IS NULL", (user_id,))
         existing_session = cursor.fetchone()
         if existing_session:
             logger.warning(f"DB: Пользователь {user_id} попытался отметиться на приходе, уже имея активную сессию.")
             return (False, "❌ Вы уже отметились на приходе. Сначала нужно отметить уход.")
 
-        # Шаг 2: Получаем департамент пользователя из таблицы users
+
+        # Шаг 2: Получение департамента (без изменений)
         cursor.execute("SELECT application_department FROM users WHERE telegram_id = ?", (user_id,))
         user_record = cursor.fetchone()
-        # Если у пользователя нет департамента, будет NULL, что нормально
         user_department = user_record['application_department'] if user_record else None
 
-        # Шаг 3: Получаем текущее МОСКОВСКОЕ время
-        moscow_time_now = datetime.now(MOSCOW_TZ)
-        checkin_time_str = moscow_time_now.strftime('%Y-%m-%d %H:%M:%S')
 
-        # Шаг 4: Записываем все данные в work_sessions
+        # --- НАЧАЛО ГЛАВНОГО ИСПРАВЛЕНИЯ: ПЕРЕХОДИМ НА UTC ---
+        # Шаг 3: Получаем текущее МОСКОВСКОЕ время (для сообщения пользователю)
+        moscow_time_now = datetime.now(MOSCOW_TZ)
+        
+        # Шаг 4: Конвертируем его в UTC (для записи в базу)
+        utc_time_now = moscow_time_now.astimezone(pytz.utc)
+        checkin_time_utc_str_for_db = utc_time_now.strftime('%Y-%m-%d %H:%M:%S')
+        # --- КОНЕЦ ГЛАВНОГО ИСПРАВЛЕНИЯ ---
+
+
+        # Шаг 5: Записываем все данные, ИСПОЛЬЗУЯ СТРОКУ UTC
         cursor.execute("""
             INSERT INTO work_sessions (telegram_id, check_in_time, checkin_type, latitude, longitude, sector_id)
             VALUES (?, ?, 'geo', ?, ?, ?)
-        """, (user_id, checkin_time_str, latitude, longitude, user_department))
+        """, (user_id, checkin_time_utc_str_for_db, latitude, longitude, user_department))
         
         conn.commit()
         
+        # В сообщении пользователю показываем МОСКОВСКОЕ время, которое он и ожидает увидеть
         time_str_for_message = moscow_time_now.strftime('%H:%M:%S')
-        logger.info(f"DB: Пользователь {user_id} успешно отметил приход по гео в {time_str_for_message} (МСК) в департаменте '{user_department}'.")
+        logger.info(f"DB: Пользователь {user_id} успешно отметил приход по гео в {time_str_for_message} (МСК). Запись в БД: {checkin_time_utc_str_for_db} (UTC). Департамент: '{user_department}'.")
         return (True, f"✅ Вы успешно отметили приход в {time_str_for_message}!")
+
 
     except sqlite3.Error as e:
         if conn:
@@ -285,20 +310,20 @@ def record_check_in(user_id: int, latitude: float, longitude: float) -> tuple[bo
         if conn:
             conn.close()
 
-
 def record_check_out(user_id: int) -> tuple[bool, str]:
     """
-    Записывает время ухода для ПОСЛЕДНЕЙ активной сессии пользователя.
-    Использует МОСКОВСКОЕ время.
+    Записывает время ухода, ВЫЧИСЛЯЕТ ДЛИТЕЛЬНОСТЬ СЕССИИ,
+    и корректно работает с UTC временем из базы.
     """
     conn = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
 
-        # Находим ID самой последней активной сессии для этого пользователя
+
+        # ШАГ 1: Находим ID сессии И ВРЕМЯ ПРИХОДА (которое в UTC)
         cursor.execute("""
-            SELECT session_id FROM work_sessions
+            SELECT session_id, check_in_time FROM work_sessions
             WHERE telegram_id = ? AND check_out_time IS NULL
             ORDER BY check_in_time DESC
             LIMIT 1
@@ -306,26 +331,48 @@ def record_check_out(user_id: int) -> tuple[bool, str]:
         
         last_session = cursor.fetchone()
 
+
         if not last_session:
             logger.warning(f"DB: Пользователь {user_id} попытался уйти, не имея активных сессий.")
             return (False, "❌ Вы не были отмечены на приходе. Невозможно отметить уход.")
 
-        session_to_close_id = last_session[0]
+
+        session_to_close_id = last_session['session_id']
+        check_in_time_utc_str = last_session['check_in_time']
         
-        # Получаем текущее МОСКОВСКОЕ время
-        moscow_time_now = datetime.now(MOSCOW_TZ)
-        checkout_time_str = moscow_time_now.strftime('%Y-%m-%d %H:%M:%S')
-
-        # Обновляем конкретную сессию по ее ID
-        cursor.execute("""
-            UPDATE work_sessions
-            SET check_out_time = ?
-            WHERE session_id = ?
-        """, (checkout_time_str, session_to_close_id))
-
+        # ШАГ 2: Превращаем время прихода из строки UTC в объект времени МОСКВЫ
+        check_in_utc_dt = datetime.strptime(check_in_time_utc_str, '%Y-%m-%d %H:%M:%S').replace(tzinfo=pytz.utc)
+        check_in_moscow_dt = check_in_utc_dt.astimezone(MOSCOW_TZ)
+        
+        # ШАГ 3: Получаем текущее время ухода в МОСКВЕ
+        checkout_moscow_dt = datetime.now(MOSCOW_TZ)
+        
+        # ШАГ 4: ВЫЧИСЛЯЕМ ДЛИТЕЛЬНОСТЬ СЕССИИ
+        duration = checkout_moscow_dt - check_in_moscow_dt
+        total_seconds = int(duration.total_seconds())
+        hours, remainder = divmod(total_seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        duration_str = f"{hours:02}:{minutes:02}:{seconds:02}"
+        
+        # ШАГ 5: Обновляем сессию в базе
+        checkout_time_str_for_db = checkout_moscow_dt.strftime('%Y-%m-%d %H:%M:%S')
+        cursor.execute(
+            "UPDATE work_sessions SET check_out_time = ? WHERE session_id = ?",
+            (checkout_time_str_for_db, session_to_close_id)
+        )
         conn.commit()
-        logger.info(f"DB: Пользователь {user_id} успешно отметил уход в {checkout_time_str} (МСК) для сессии {session_to_close_id}.")
-        return (True, f"✅ Вы успешно отметили уход в {moscow_time_now.strftime('%H:%M:%S')}. Хорошего вечера!")
+        
+        # ШАГ 6: Формируем новое, информативное сообщение
+        checkout_time_display = checkout_moscow_dt.strftime('%H:%M:%S')
+        message = (
+            f"✅ Вы успешно отметили уход в {checkout_time_display}.\n\n"
+            f"⏱️ **Продолжительность сессии:** {duration_str}\n\n"
+            f"Хорошего вечера!"
+        )
+        
+        logger.info(f"DB: Пользователь {user_id} успешно отметил уход для сессии {session_to_close_id}. Длительность: {duration_str}.")
+        return (True, message)
+
 
     except sqlite3.Error as e:
         if conn:
@@ -477,25 +524,26 @@ def get_unique_departments() -> list:
 def add_manual_checkin_request(user_id: int, requested_checkin_time: datetime) -> bool:
     """
     Добавляет новую заявку на ручную отметку прихода в базу данных.
-    :param user_id: Telegram ID пользователя.
-    :param requested_checkin_time: Запрошенное пользователем время прихода (объект datetime).
-    :return: True в случае успеха, False в случае ошибки.
+    Принимает datetime объект (в UTC) и сохраняет его как текст.
     """
     conn = None
     try:
         conn = get_db_connection() 
         cursor = conn.cursor()
         
-        # Форматируем datetime в строку ISO8601 для SQLite
+        # Мы берем datetime объект (который УЖЕ в UTC из bot_main.py)
+        # и просто форматируем его в строку для SQLite.
         requested_time_str = requested_checkin_time.strftime('%Y-%m-%d %H:%M:%S')
+        # ------------------------------------
         
         cursor.execute("""
             INSERT INTO manual_checkin_requests 
             (user_id, requested_checkin_time, request_timestamp, status)
             VALUES (?, ?, datetime('now', 'localtime'), 'pending') 
-        """, (user_id, requested_time_str)) # Используем datetime('now', 'localtime') для request_timestamp
+        """, (user_id, requested_time_str))
         conn.commit()
-        logger.info(f"DB: Новая заявка на ручную отметку прихода добавлена для user_id={user_id}, время={requested_time_str}")
+        
+        logger.info(f"DB: Новая заявка на ручную отметку прихода добавлена для user_id={user_id}, время={requested_time_str} (UTC)")
         return True
     except sqlite3.Error as e:
         logger.error(f"DB_ERROR: Ошибка при добавлении заявки на ручную отметку для user_id={user_id}: {e}", exc_info=True)
@@ -506,12 +554,13 @@ def add_manual_checkin_request(user_id: int, requested_checkin_time: datetime) -
 
 def get_pending_manual_checkin_requests() -> list:
     """
-    Возвращает список ожидающих ручных заявок, ОБЪЕДИНЕННЫЙ с данными пользователя (имя, департамент).
+    Возвращает список ожидающих ручных заявок в виде СЛОВАРЕЙ, 
+    объединенный с данными пользователя.
     """
     conn = None
     try:
         conn = get_db_connection()
-        conn.row_factory = sqlite3.Row
+        conn.row_factory = sqlite3.Row # Это оставляем, это полезно
         cursor = conn.cursor()
         
         sql_query = """
@@ -531,9 +580,15 @@ def get_pending_manual_checkin_requests() -> list:
         """
         
         cursor.execute(sql_query)
-        requests = cursor.fetchall()
-        logger.info(f"DB: Найдено {len(requests)} ожидающих заявок на ручную отметку.")
-        return requests
+        requests_rows = cursor.fetchall() # Получаем список sqlite3.Row
+        
+        # --- КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: Превращаем каждый sqlite3.Row в обычный dict ---
+        requests_dicts = [dict(row) for row in requests_rows]
+        # --------------------------------------------------------------------------
+
+
+        logger.info(f"DB: Найдено {len(requests_dicts)} ожидающих заявок на ручную отметку.")
+        return requests_dicts # Возвращаем список словарей
         
     except sqlite3.Error as e:
         logger.error(f"DB_ERROR: Ошибка при получении списка ручных заявок: {e}", exc_info=True)
@@ -542,57 +597,58 @@ def get_pending_manual_checkin_requests() -> list:
         if conn:
             conn.close()
 
-
-def approve_all_pending_manual_checkins() -> tuple[int, int]:
+def approve_all_pending_manual_checkins(admin_id: int) -> tuple[int, int]:
     """
     Одобряет все ожидающие ручные заявки в рамках одной транзакции.
+    Возвращает кортеж (количество успешных, количество неуспешных).
     """
     conn = None
     approved_count = 0
     failed_count = 0
-    total_requests = 0
     
     try:
-        conn = get_db_connection()
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-
-        pending_requests = get_pending_manual_checkin_requests() 
-        
+        # Получаем все заявки для обработки
+        pending_requests = get_pending_manual_checkin_requests()
         if not pending_requests:
             return (0, 0)
 
-        total_requests = len(pending_requests)
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        processed_time_str = datetime.now(MOSCOW_TZ).strftime('%Y-%m-%d %H:%M:%S')
+
 
         for req in pending_requests:
             try:
                 # Шаг 1: Добавляем рабочую сессию
                 cursor.execute(
-                    "INSERT INTO work_sessions (telegram_id, check_in_time) VALUES (?, ?)",
-                    (req['user_id'], req['requested_checkin_time'])
+                    "INSERT INTO work_sessions (telegram_id, check_in_time, checkin_type, sector_id) VALUES (?, ?, 'manual_admin', ?)",
+                    (req['user_id'], req['requested_checkin_time'], req['application_department'])
                 )
                 
-                # --- ГЛАВНОЕ ИСПРАВЛЕНИЕ: УБИРАЕМ processed_by ---
-                # Шаг 2: Обновляем статус заявки
+                # --- ГЛАВНОЕ ИСПРАВЛЕНИЕ: МЕНЯЕМ ИМЯ СТОЛБЦА ---
                 cursor.execute(
-                    "UPDATE manual_checkin_requests SET status = 'approved' WHERE request_id = ?",
-                    (req['request_id'],)
+                    "UPDATE manual_checkin_requests SET status = 'approved', admin_id_processed = ?, processed_timestamp = ? WHERE request_id = ?",
+                    (admin_id, processed_time_str, req['request_id'])
                 )
+                # -------------------------------------------------
                 
                 approved_count += 1
             except sqlite3.Error as e:
-                logger.error(f"DB_ERROR: Ошибка при массовом одобрении заявки {req['request_id']}: {e}", exc_info=True)
+                logger.error(f"DB_ERROR: Ошибка при массовом одобрении заявки {req['request_id']}: {e}")
                 failed_count += 1
         
         conn.commit()
-        logger.info(f"DB: Массовое одобрение завершено. Успешно: {approved_count}, Ошибки: {failed_count}.")
+        logger.info(f"DB: Массовое одобрение завершено админом {admin_id}. Успешно: {approved_count}, Ошибки: {failed_count}.")
         return (approved_count, failed_count)
 
+
     except sqlite3.Error as e:
-        logger.error(f"DB_ERROR: Критическая ошибка в approve_all_pending_manual_checkins: {e}", exc_info=True)
+        logger.error(f"DB_ERROR: Критическая ошибка в approve_all_pending_manual_checkins: {e}")
         if conn:
             conn.rollback() 
-        return (0, total_requests)
+        return (0, len(pending_requests) if 'pending_requests' in locals() else 0)
     finally:
         if conn:
             conn.close()
@@ -602,14 +658,14 @@ def approve_all_pending_manual_checkins() -> tuple[int, int]:
 
 def get_manual_checkin_request_by_id(request_id: int):
     """
-    Возвращает детали конкретной заявки на ручную отметку по ее ID,
-    включая информацию о пользователе.
+    Возвращает детали конкретной заявки в виде СЛОВАРЯ.
     """
     conn = None
-    request_data_row = None
     try:
         conn = get_db_connection()
+        conn.row_factory = sqlite3.Row # Это оставляем
         cursor = conn.cursor()
+        
         cursor.execute("""
             SELECT 
                 mcr.request_id, 
@@ -619,59 +675,81 @@ def get_manual_checkin_request_by_id(request_id: int):
                 u.username,
                 u.first_name,
                 u.last_name,
-                u.application_department -- Ключ сектора пользователя
+                u.application_department
             FROM manual_checkin_requests mcr
             JOIN users u ON mcr.user_id = u.telegram_id
             WHERE mcr.request_id = ?
         """, (request_id,))
-        request_data_row = cursor.fetchone() # fetchone() возвращает один sqlite3.Row объект или None
+        
+        request_data_row = cursor.fetchone() # Получаем sqlite3.Row или None
+        
+        # --- КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: Превращаем sqlite3.Row в dict ---
         if request_data_row:
             logger.info(f"DB: Получена заявка на ручную отметку с ID={request_id}.")
+            return dict(request_data_row) # Возвращаем СЛОВАРЬ
         else:
             logger.warning(f"DB: Заявка на ручную отметку с ID={request_id} не найдена.")
+            return None # Если ничего не найдено, возвращаем None
+        # -----------------------------------------------------------------
+
+
     except sqlite3.Error as e:
         logger.error(f"DB_ERROR: Ошибка при получении ручной заявки по ID={request_id}: {e}", exc_info=True)
+        return None
     finally:
         if conn:
             conn.close()
-    return request_data_row
 
 def approve_manual_checkin_request(request_id: int, admin_id: int, final_checkin_time_local: datetime, user_id: int, user_sector_key: str) -> bool:
     """
     Одобряет заявку на ручную отметку.
-    Считает, что final_checkin_time_local - это уже готовое МОСКОВСКОЕ время.
+    ТЕПЕРЬ СОХРАНЯЕТ ВРЕМЯ В БАЗУ В ФОРМАТЕ UTC.
     """
     conn = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
         
-        checkin_time_str = final_checkin_time_local.strftime('%Y-%m-%d %H:%M:%S')
-        processed_time_str = datetime.now(MOSCOW_TZ).strftime('%Y-%m-%d %H:%M:%S')
+        # --- НАЧАЛО ГЛАВНОГО ИСПРАВЛЕНИЯ: ПЕРЕХОДИМ НА UTC ---
+        # Входное время final_checkin_time_local - это МОСКОВСКОЕ время.
+        # Конвертируем его в UTC для записи в базу.
+        final_checkin_time_utc = final_checkin_time_local.astimezone(pytz.utc)
+        checkin_time_utc_str_for_db = final_checkin_time_utc.strftime('%Y-%m-%d %H:%M:%S')
+        
+        # Время обработки заявки тоже лучше хранить в UTC для единообразия
+        processed_time_utc_str = datetime.now(pytz.utc).strftime('%Y-%m-%d %H:%M:%S')
+        # --- КОНЕЦ ГЛАВНОГО ИСПРАВЛЕНИЯ ---
 
-        # 1. Обновляем заявку
+
+        # Обновляем саму заявку, используя время в UTC
         cursor.execute("""
             UPDATE manual_checkin_requests
             SET status = 'approved',
-                processed_by = ?,
-                processed_timestamp = ?
+                admin_id_processed = ?, 
+                processed_timestamp = ?,
+                final_checkin_time = ?
             WHERE request_id = ? AND status = 'pending'
-        """, (admin_id, processed_time_str, request_id))
+        """, (admin_id, processed_time_utc_str, checkin_time_utc_str_for_db, request_id))
         
         if cursor.rowcount == 0:
             logger.warning(f"DB: Не удалось обновить заявку {request_id} для одобрения (возможно, уже обработана).")
             conn.rollback()
             return False
 
-        # 2. Создаем рабочую сессию, ТЕПЕРЬ С СЕКТОРОМ
+
+        # Создаем рабочую сессию, используя время в UTC
         cursor.execute("""
             INSERT INTO work_sessions (telegram_id, check_in_time, checkin_type, sector_id)
             VALUES (?, ?, 'manual_admin', ?)
-        """, (user_id, checkin_time_str, user_sector_key))
+        """, (user_id, checkin_time_utc_str_for_db, user_sector_key))
         
         conn.commit()
-        logger.info(f"DB: Заявка {request_id} одобрена. Создана сессия для user_id={user_id}, сектор='{user_sector_key}', время='{checkin_time_str}' (МСК).")
+        
+        # В логах для ясности указываем оба времени
+        local_time_str = final_checkin_time_local.strftime('%Y-%m-%d %H:%M:%S')
+        logger.info(f"DB: Заявка {request_id} одобрена. Создана сессия для user_id={user_id}, сектор='{user_sector_key}'. Время (MSK): {local_time_str}, Время в БД (UTC): {checkin_time_utc_str_for_db}.")
         return True
+
 
     except sqlite3.Error as e:
         if conn:
