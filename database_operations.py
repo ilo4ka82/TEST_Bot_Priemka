@@ -253,7 +253,7 @@ def record_check_in(user_id: int, latitude: float, longitude: float) -> tuple[bo
     """
     Записывает время прихода по геолокации.
     1. Проверяет, что нет других активных сессий.
-    2. ТЕПЕРЬ СОХРАНЯЕТ ВРЕМЯ В БАЗУ В ФОРМАТЕ UTC.
+    2. ТЕПЕРЬ ВСЕГДА ИСПОЛЬЗУЕТ И ЗАПИСЫВАЕТ МОСКОВСКОЕ ВРЕМЯ.
     3. Находит и записывает департамент пользователя (sector_id).
     """
     conn = None
@@ -277,27 +277,26 @@ def record_check_in(user_id: int, latitude: float, longitude: float) -> tuple[bo
         user_department = user_record['application_department'] if user_record else None
 
 
-        # --- НАЧАЛО ГЛАВНОГО ИСПРАВЛЕНИЯ: ПЕРЕХОДИМ НА UTC ---
-        # Шаг 3: Получаем текущее МОСКОВСКОЕ время (для сообщения пользователю)
+        # --- НАЧАЛО ГЛАВНОГО ИСПРАВЛЕНИЯ: ВОЗВРАЩАЕМСЯ К ПРОСТОМУ MSK ---
+        # Шаг 3: Получаем текущее МОСКОВСКОЕ время
         moscow_time_now = datetime.now(MOSCOW_TZ)
         
-        # Шаг 4: Конвертируем его в UTC (для записи в базу)
-        utc_time_now = moscow_time_now.astimezone(pytz.utc)
-        checkin_time_utc_str_for_db = utc_time_now.strftime('%Y-%m-%d %H:%M:%S')
+        # Шаг 4: Превращаем его в строку для записи в базу
+        checkin_time_str_for_db = moscow_time_now.strftime('%Y-%m-%d %H:%M:%S')
         # --- КОНЕЦ ГЛАВНОГО ИСПРАВЛЕНИЯ ---
 
 
-        # Шаг 5: Записываем все данные, ИСПОЛЬЗУЯ СТРОКУ UTC
+        # Шаг 5: Записываем все данные, ИСПОЛЬЗУЯ СТРОКУ МОСКОВСКОГО ВРЕМЕНИ
         cursor.execute("""
             INSERT INTO work_sessions (telegram_id, check_in_time, checkin_type, latitude, longitude, sector_id)
             VALUES (?, ?, 'geo', ?, ?, ?)
-        """, (user_id, checkin_time_utc_str_for_db, latitude, longitude, user_department))
+        """, (user_id, checkin_time_str_for_db, latitude, longitude, user_department))
         
         conn.commit()
         
         # В сообщении пользователю показываем МОСКОВСКОЕ время, которое он и ожидает увидеть
         time_str_for_message = moscow_time_now.strftime('%H:%M:%S')
-        logger.info(f"DB: Пользователь {user_id} успешно отметил приход по гео в {time_str_for_message} (МСК). Запись в БД: {checkin_time_utc_str_for_db} (UTC). Департамент: '{user_department}'.")
+        logger.info(f"DB: Пользователь {user_id} успешно отметил приход по гео в {time_str_for_message} (МСК) в департаменте '{user_department}'.")
         return (True, f"✅ Вы успешно отметили приход в {time_str_for_message}!")
 
 
@@ -313,15 +312,16 @@ def record_check_in(user_id: int, latitude: float, longitude: float) -> tuple[bo
 def record_check_out(user_id: int) -> tuple[bool, str]:
     """
     Записывает время ухода, ВЫЧИСЛЯЕТ ДЛИТЕЛЬНОСТЬ СЕССИИ,
-    и корректно работает с UTC временем из базы.
+    и теперь работает ТОЛЬКО С МОСКОВСКИМ ВРЕМЕНЕМ из базы.
     """
     conn = None
     try:
         conn = get_db_connection()
+        # Используем conn.row_factory в get_db_connection, здесь не нужно
         cursor = conn.cursor()
 
 
-        # ШАГ 1: Находим ID сессии И ВРЕМЯ ПРИХОДА (которое в UTC)
+        # ШАГ 1: Находим ID сессии И ВРЕМЯ ПРИХОДА (которое теперь в МСК)
         cursor.execute("""
             SELECT session_id, check_in_time FROM work_sessions
             WHERE telegram_id = ? AND check_out_time IS NULL
@@ -329,32 +329,35 @@ def record_check_out(user_id: int) -> tuple[bool, str]:
             LIMIT 1
         """, (user_id,))
         
-        last_session = cursor.fetchone()
-
-
-        if not last_session:
+        # Используем dict(fetchone()) для удобства
+        row = cursor.fetchone()
+        if not row:
             logger.warning(f"DB: Пользователь {user_id} попытался уйти, не имея активных сессий.")
             return (False, "❌ Вы не были отмечены на приходе. Невозможно отметить уход.")
-
-
+        
+        last_session = dict(row)
         session_to_close_id = last_session['session_id']
-        check_in_time_utc_str = last_session['check_in_time']
+        check_in_time_msk_str = last_session['check_in_time']
         
-        # ШАГ 2: Превращаем время прихода из строки UTC в объект времени МОСКВЫ
-        check_in_utc_dt = datetime.strptime(check_in_time_utc_str, '%Y-%m-%d %H:%M:%S').replace(tzinfo=pytz.utc)
-        check_in_moscow_dt = check_in_utc_dt.astimezone(MOSCOW_TZ)
+        # --- НАЧАЛО ГЛАВНОГО ИСПРАВЛЕНИЯ: УПРОЩАЕМ ЧТЕНИЕ ВРЕМЕНИ ---
+        # Шаг 2: Превращаем строку МСК из базы в объект времени МСК
+        # Мы больше не конвертируем из UTC, а просто парсим строку как есть
+        # и добавляем информацию о часовом поясе.
+        check_in_time_naive = datetime.strptime(check_in_time_msk_str, '%Y-%m-%d %H:%M:%S')
+        check_in_moscow_dt = MOSCOW_TZ.localize(check_in_time_naive)
+        # --- КОНЕЦ ГЛАВНОГО ИСПРАВЛЕНИЯ ---
         
-        # ШАГ 3: Получаем текущее время ухода в МОСКВЕ
+        # Шаг 3: Получаем текущее время ухода в МОСКВЕ (без изменений)
         checkout_moscow_dt = datetime.now(MOSCOW_TZ)
         
-        # ШАГ 4: ВЫЧИСЛЯЕМ ДЛИТЕЛЬНОСТЬ СЕССИИ
+        # Шаг 4: ВЫЧИСЛЯЕМ ДЛИТЕЛЬНОСТЬ СЕССИИ (без изменений, теперь работает правильно)
         duration = checkout_moscow_dt - check_in_moscow_dt
         total_seconds = int(duration.total_seconds())
         hours, remainder = divmod(total_seconds, 3600)
-        minutes, seconds = divmod(remainder, 60)
-        duration_str = f"{hours:02}:{minutes:02}:{seconds:02}"
+        minutes, _ = divmod(remainder, 60) # секунды в длительности не так важны
+        duration_str = f"{hours} ч {minutes:02} мин"
         
-        # ШАГ 5: Обновляем сессию в базе
+        # Шаг 5: Обновляем сессию в базе (без изменений)
         checkout_time_str_for_db = checkout_moscow_dt.strftime('%Y-%m-%d %H:%M:%S')
         cursor.execute(
             "UPDATE work_sessions SET check_out_time = ? WHERE session_id = ?",
@@ -362,7 +365,7 @@ def record_check_out(user_id: int) -> tuple[bool, str]:
         )
         conn.commit()
         
-        # ШАГ 6: Формируем новое, информативное сообщение
+        # Шаг 6: Формируем новое, информативное сообщение (без изменений)
         checkout_time_display = checkout_moscow_dt.strftime('%H:%M:%S')
         message = (
             f"✅ Вы успешно отметили уход в {checkout_time_display}.\n\n"
@@ -703,25 +706,24 @@ def get_manual_checkin_request_by_id(request_id: int):
 def approve_manual_checkin_request(request_id: int, admin_id: int, final_checkin_time_local: datetime, user_id: int, user_sector_key: str) -> bool:
     """
     Одобряет заявку на ручную отметку.
-    ТЕПЕРЬ СОХРАНЯЕТ ВРЕМЯ В БАЗУ В ФОРМАТЕ UTC.
+    ТЕПЕРЬ ВСЕГДА ИСПОЛЬЗУЕТ И ЗАПИСЫВАЕТ МОСКОВСКОЕ ВРЕМЯ.
     """
     conn = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
         
-        # --- НАЧАЛО ГЛАВНОГО ИСПРАВЛЕНИЯ: ПЕРЕХОДИМ НА UTC ---
-        # Входное время final_checkin_time_local - это МОСКОВСКОЕ время.
-        # Конвертируем его в UTC для записи в базу.
-        final_checkin_time_utc = final_checkin_time_local.astimezone(pytz.utc)
-        checkin_time_utc_str_for_db = final_checkin_time_utc.strftime('%Y-%m-%d %H:%M:%S')
+        # --- НАЧАЛО ГЛАВНОГО ИСПРАВЛЕНИЯ: ВОЗВРАЩАЕМСЯ К ПРОСТОМУ MSK ---
+        # Входное время final_checkin_time_local - это уже МОСКОВСКОЕ время.
+        # Просто превращаем его в строку для записи в базу.
+        checkin_time_msk_str_for_db = final_checkin_time_local.strftime('%Y-%m-%d %H:%M:%S')
         
-        # Время обработки заявки тоже лучше хранить в UTC для единообразия
-        processed_time_utc_str = datetime.now(pytz.utc).strftime('%Y-%m-%d %H:%M:%S')
+        # Время обработки заявки тоже берем в московском времени.
+        processed_time_msk_str = datetime.now(MOSCOW_TZ).strftime('%Y-%m-%d %H:%M:%S')
         # --- КОНЕЦ ГЛАВНОГО ИСПРАВЛЕНИЯ ---
 
 
-        # Обновляем саму заявку, используя время в UTC
+        # Обновляем саму заявку, используя МОСКОВСКОЕ время
         cursor.execute("""
             UPDATE manual_checkin_requests
             SET status = 'approved',
@@ -729,7 +731,7 @@ def approve_manual_checkin_request(request_id: int, admin_id: int, final_checkin
                 processed_timestamp = ?,
                 final_checkin_time = ?
             WHERE request_id = ? AND status = 'pending'
-        """, (admin_id, processed_time_utc_str, checkin_time_utc_str_for_db, request_id))
+        """, (admin_id, processed_time_msk_str, checkin_time_msk_str_for_db, request_id))
         
         if cursor.rowcount == 0:
             logger.warning(f"DB: Не удалось обновить заявку {request_id} для одобрения (возможно, уже обработана).")
@@ -737,17 +739,15 @@ def approve_manual_checkin_request(request_id: int, admin_id: int, final_checkin
             return False
 
 
-        # Создаем рабочую сессию, используя время в UTC
+        # Создаем рабочую сессию, используя МОСКОВСКОЕ время
         cursor.execute("""
             INSERT INTO work_sessions (telegram_id, check_in_time, checkin_type, sector_id)
             VALUES (?, ?, 'manual_admin', ?)
-        """, (user_id, checkin_time_utc_str_for_db, user_sector_key))
+        """, (user_id, checkin_time_msk_str_for_db, user_sector_key))
         
         conn.commit()
         
-        # В логах для ясности указываем оба времени
-        local_time_str = final_checkin_time_local.strftime('%Y-%m-%d %H:%M:%S')
-        logger.info(f"DB: Заявка {request_id} одобрена. Создана сессия для user_id={user_id}, сектор='{user_sector_key}'. Время (MSK): {local_time_str}, Время в БД (UTC): {checkin_time_utc_str_for_db}.")
+        logger.info(f"DB: Заявка {request_id} одобрена. Создана сессия для user_id={user_id}, сектор='{user_sector_key}', время='{checkin_time_msk_str_for_db}' (МСК).")
         return True
 
 

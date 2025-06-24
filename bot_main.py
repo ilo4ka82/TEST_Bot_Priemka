@@ -681,45 +681,45 @@ async def request_manual_checkin_start(update: Update, context: ContextTypes.DEF
 
 async def process_manual_checkin_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """
-    Обрабатывает введенное пользователем время для ручной отметки прихода.
-    ТЕПЕРЬ ПРАВИЛЬНО ВЫЗЫВАЕТ СПЕЦИАЛЬНУЮ ФУНКЦИЮ УВЕДОМЛЕНИЙ.
+    Обрабатывает введенное пользователем время для ручной отметки.
+    ТЕПЕРЬ СОЗДАЕТ И ПЕРЕДАЕТ В БАЗУ ТОЛЬКО МОСКОВСКОЕ ВРЕМЯ.
     """
     user = update.effective_user
     user_input_time_str = update.message.text
     
     try:
-        # Эта часть уже работает правильно:
-        # Создаем "наивный" объект из ввода, потом делаем его "московским", потом конвертируем в UTC для базы
+        # --- НАЧАЛО ГЛАВНОГО ИСПРАВЛЕНИЯ: УДАЛЯЕМ КОНВЕРТАЦИЮ В UTC ---
+        # Шаг 1: Создаем "наивный" объект из ввода пользователя
         naive_dt = datetime.strptime(user_input_time_str, '%d.%m.%Y %H:%M')
-        moscow_dt = MOSCOW_TZ.localize(naive_dt)
-        utc_dt = moscow_dt.astimezone(pytz.utc)
         
-        # Передаем в базу объект времени в UTC
-        success = db.add_manual_checkin_request(user_id=user.id, requested_checkin_time=utc_dt)
+        # Шаг 2: Делаем его "московским". Это финальный объект времени.
+        moscow_dt = MOSCOW_TZ.localize(naive_dt)
+        # --- КОНЕЦ ГЛАВНОГО ИСПРАВЛЕНИЯ ---
+        
+        # Передаем в базу ЧИСТЫЙ объект времени в МСК
+        success = db.add_manual_checkin_request(user_id=user.id, requested_checkin_time=moscow_dt)
         
         if success:
+            # В сообщении пользователю показываем время, которое он ввел
             await update.message.reply_text(
                 f"Спасибо! Ваша заявка на ручную отметку прихода на "
-                f"**{naive_dt.strftime('%d.%m.%Y %H:%M')}** принята и отправлена администратору."
+                f"**{moscow_dt.strftime('%d.%m.%Y %H:%M')}** принята и отправлена администратору."
             )
-            logger.info(f"User {user.id} успешно подал заявку на ручную отметку прихода на {naive_dt} (MSK).")
+            logger.info(f"User {user.id} успешно подал заявку на ручную отметку прихода на {moscow_dt} (MSK).")
             
-            # --- НАЧАЛО ИСПРАВЛЕНИЯ: ВЫЗЫВАЕМ ТВОЮ ФУНКЦИЮ ---
+            # Вызываем уведомление для админов
             try:
-                # Важно: мы передаем в нее naive_dt — это то самое время, которое ввел пользователь (московское),
-                # чтобы в уведомлении админу отображалось именно оно (например, '08:00'), а не время в UTC.
-                await notify_admins_new_manual_request(context.bot, user, naive_dt)
+                # Передаем в уведомление тот же объект времени МСК
+                await notify_admins_new_manual_request(context.bot, user, moscow_dt)
             except Exception as e:
-                # Делаем систему надежнее: если уведомления не отправятся, основной процесс не сломается.
                 logger.error(f"Критическая ошибка при вызове notify_admins_new_manual_request: {e}", exc_info=True)
-            # --- КОНЕЦ ИСПРАВЛЕНИЯ ---
 
 
         else:
             await update.message.reply_text(
                 "Произошла ошибка при сохранении вашей заявки. Пожалуйста, попробуйте позже или свяжитесь с администратором."
             )
-            logger.error(f"Не удалось сохранить заявку на ручную отметку для user {user.id} на время {naive_dt}.")
+            logger.error(f"Не удалось сохранить заявку на ручную отметку для user {user.id} на время {moscow_dt}.")
             
         return ConversationHandler.END
 
