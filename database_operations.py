@@ -527,18 +527,20 @@ def get_unique_departments() -> list:
 def add_manual_checkin_request(user_id: int, requested_checkin_time: datetime) -> bool:
     """
     Добавляет новую заявку на ручную отметку прихода в базу данных.
-    Принимает datetime объект (в UTC) и сохраняет его как текст.
+    Принимает datetime объект (в МСК) и сохраняет его как текст.
     """
     conn = None
     try:
         conn = get_db_connection() 
         cursor = conn.cursor()
         
-        # Мы берем datetime объект (который УЖЕ в UTC из bot_main.py)
-        # и просто форматируем его в строку для SQLite.
+        # --- НАЧАЛО ГЛАВНОГО ИСПРАВЛЕНИЯ: УПРОЩАЕМ ДО ПРЕДЕЛА ---
+        # Мы берем datetime объект (который УЖЕ в МСК из bot_main.py)
+        # и просто форматируем его в строку для SQLite. Никаких конвертаций.
         requested_time_str = requested_checkin_time.strftime('%Y-%m-%d %H:%M:%S')
-        # ------------------------------------
+        # --- КОНЕЦ ГЛАВНОГО ИСПРАВЛЕНИЯ ---
         
+        # Вставляем ЧИСТУЮ строку с московским временем
         cursor.execute("""
             INSERT INTO manual_checkin_requests 
             (user_id, requested_checkin_time, request_timestamp, status)
@@ -546,7 +548,8 @@ def add_manual_checkin_request(user_id: int, requested_checkin_time: datetime) -
         """, (user_id, requested_time_str))
         conn.commit()
         
-        logger.info(f"DB: Новая заявка на ручную отметку прихода добавлена для user_id={user_id}, время={requested_time_str} (UTC)")
+        # Обновляем лог, чтобы он говорил правду
+        logger.info(f"DB: Новая заявка на ручную отметку прихода добавлена для user_id={user_id}, время={requested_time_str} (МСК)")
         return True
     except sqlite3.Error as e:
         logger.error(f"DB_ERROR: Ошибка при добавлении заявки на ручную отметку для user_id={user_id}: {e}", exc_info=True)
