@@ -904,24 +904,21 @@ async def approve_all_requests_callback(update: Update, context: ContextTypes.DE
 async def admin_select_manual_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """
     Показывает детали одной заявки и кнопки для действий.
-    Теперь умеет работать и при "возврате назад".
+    ТЕПЕРЬ ПРАВИЛЬНО ОТОБРАЖАЕТ МОСКОВСКОЕ ВРЕМЯ ИЗ БАЗЫ.
     """
     query = update.callback_query
     await query.answer()
 
 
-    # --- НАЧАЛО ИСПРАВЛЕНИЯ ---
+    # Этот блок для получения ID правильный
     try:
-        # Сначала пытаемся получить ID из callback_data (стандартный путь)
         request_id = int(query.data.split('_')[-1])
     except ValueError:
-        # Если не получилось (значит, это кнопка "назад"), берем ID из контекста
         req_data = context.user_data.get('current_manual_request')
         if not req_data:
             await query.edit_message_text("Ошибка: данные о заявке потеряны. Начните заново.", reply_markup=None)
             return ConversationHandler.END
         request_id = req_data['request_id']
-    # --- КОНЕЦ ИСПРАВЛЕНИЯ ---
 
 
     req = db.get_manual_checkin_request_by_id(request_id)
@@ -932,18 +929,25 @@ async def admin_select_manual_request(update: Update, context: ContextTypes.DEFA
         return ConversationHandler.END
 
 
-    context.user_data['current_manual_request'] = dict(req) # Обновляем на всякий случай
+    context.user_data['current_manual_request'] = dict(req)
     user_info = f"{req.get('first_name', '')} {req.get('last_name', '')} (@{req.get('username', 'N/A')})".strip()
 
 
-    # --- Блок с исправлением времени (он уже правильный) ---
+    # --- НАЧАЛО ГЛАВНОГО ИСПРАВЛЕНИЯ: УПРОЩАЕМ ОТОБРАЖЕНИЕ ВРЕМЕНИ ---
     try:
-        naive_dt = datetime.strptime(req['requested_checkin_time'], '%Y-%m-%d %H:%M:%S')
-        utc_dt = naive_dt.replace(tzinfo=pytz.utc)
-        moscow_dt = utc_dt.astimezone(MOSCOW_TZ)
-        display_time = moscow_dt.strftime('%d.%m.%Y в %H:%M')
-    except Exception:
+        # Шаг 1: Берем строку МСК из базы (например, '... 07:00:00')
+        msk_time_str_from_db = req['requested_checkin_time']
+        
+        # Шаг 2: Превращаем ее в "наивный" объект времени
+        naive_dt = datetime.strptime(msk_time_str_from_db, '%Y-%m-%d %H:%M:%S')
+        
+        # Шаг 3: Просто форматируем его для вывода. Никаких конвертаций.
+        display_time = naive_dt.strftime('%d.%m.%Y в %H:%M')
+    except (TypeError, ValueError):
+        # Ловим ошибки, если в базе что-то не так с форматом
+        logger.warning(f"Ошибка формата времени в заявке {req.get('request_id')}: {req.get('requested_checkin_time')}")
         display_time = "Ошибка формата времени"
+    # --- КОНЕЦ ГЛАВНОГО ИСПРАВЛЕНИЯ ---
 
 
     message_text = (
