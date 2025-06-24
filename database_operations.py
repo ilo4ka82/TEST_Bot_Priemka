@@ -114,6 +114,9 @@ def add_or_update_user(telegram_id: int, username: str = None, first_name: str =
     conn = get_db_connection()
     try:
         cursor = conn.cursor()
+        
+        registration_time_msk = datetime.now(MOSCOW_TZ)
+
         cursor.execute('''
             INSERT INTO users (telegram_id, username, first_name, last_name, registration_date)
             VALUES (?, ?, ?, ?, ?)
@@ -121,7 +124,7 @@ def add_or_update_user(telegram_id: int, username: str = None, first_name: str =
                 username = COALESCE(excluded.username, users.username),
                 first_name = COALESCE(excluded.first_name, users.first_name),
                 last_name = COALESCE(excluded.last_name, users.last_name)
-        ''', (telegram_id, username, first_name, last_name, datetime.now(tz=utc)))
+        ''', (telegram_id, username, first_name, last_name, registration_time_msk))
         conn.commit()
         logger.info(f"Пользователь {telegram_id} ({first_name}) добавлен/обновлен в БД.")
         return True
@@ -131,6 +134,7 @@ def add_or_update_user(telegram_id: int, username: str = None, first_name: str =
     finally:
         if conn:
             conn.close()
+
 
 def get_user(telegram_id: int):
     """
@@ -767,14 +771,18 @@ def approve_manual_checkin_request(request_id: int, admin_id: int, final_checkin
 def reject_manual_checkin_request(request_id: int, admin_id: int) -> bool:
     """
     Отклоняет заявку на ручную отметку и обновляет ее статус.
+    ТЕПЕРЬ ЗАПИСЫВАЕТ ВРЕМЯ ОБРАБОТКИ В МСК.
     """
     conn = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
         
-        # Время обработки всегда в UTC
-        processed_time_utc_str = datetime.now(utc).strftime('%Y-%m-%d %H:%M:%S')
+        # --- НАЧАЛО ГЛАВНОГО ИСПРАВЛЕНИЯ ---
+        # Время обработки теперь всегда в МСК для консистентности
+        processed_time_msk_str = datetime.now(MOSCOW_TZ).strftime('%Y-%m-%d %H:%M:%S')
+        # --- КОНЕЦ ГЛАВНОГО ИСПРАВЛЕНИЯ ---
+
 
         cursor.execute("""
             UPDATE manual_checkin_requests
@@ -782,11 +790,11 @@ def reject_manual_checkin_request(request_id: int, admin_id: int) -> bool:
                 admin_id_processed = ?,
                 processed_timestamp = ?
             WHERE request_id = ? AND status = 'pending'
-        """, (admin_id, processed_time_utc_str, request_id))
+        """, (admin_id, processed_time_msk_str, request_id))
         
         if cursor.rowcount == 0:
             logger.warning(f"DB: Не удалось отклонить заявку {request_id} (возможно, уже обработана или не найдена).")
-            return False # Транзакцию откатывать не нужно, т.к. это одно действие
+            return False
             
         conn.commit()
         logger.info(f"DB: Заявка {request_id} отклонена админом {admin_id}.")
