@@ -1075,7 +1075,8 @@ async def admin_receive_new_time(update: Update, context: ContextTypes.DEFAULT_T
 
 async def admin_handle_final_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """
-    Обрабатывает финальное 'Да'/'Нет', РЕДАКТИРУЕТ СООБЩЕНИЕ и ЗАВЕРШАЕТ диалог.
+    Обрабатывает финальное 'Да'/'Нет', ТЕПЕРЬ ПРАВИЛЬНО РАБОТАЕТ С ВРЕМЕНЕМ,
+    редактирует сообщение и завершает диалог.
     """
     query = update.callback_query
     await query.answer()
@@ -1094,24 +1095,31 @@ async def admin_handle_final_confirmation(update: Update, context: ContextTypes.
 
     if action == "reject":
         db.reject_manual_checkin_request(req['request_id'], admin_id)
-        # РЕДАКТИРУЕМ сообщение в финальный результат и убираем кнопки
         await query.edit_message_text(f"❌ Заявка от <b>{user_info}</b> отклонена.", parse_mode=ParseMode.HTML, reply_markup=None)
         await context.bot.send_message(req['user_id'], "❌ Ваша заявка на ручную отметку была отклонена.")
     
     else: # 'approve_as_is' или 'approve_new_time'
         if action == 'approve_new_time':
+            # Этот блок уже работает правильно, т.к. 'new_time_from_admin' - это уже готовый объект МСК
             checkin_time = context.user_data.get('new_time_from_admin')
             final_message_action = "одобрена с новым временем"
         else: # 'approve_as_is'
-            utc_time = datetime.strptime(req['requested_checkin_time'], '%Y-%m-%d %H:%M:%S').replace(tzinfo=pytz.utc)
-            checkin_time = utc_time.astimezone(MOSCOW_TZ)
+            # --- НАЧАЛО ГЛАВНОГО ИСПРАВЛЕНИЯ ---
+            # Шаг 1: Берем строку МСК из базы (например, '... 07:00:00')
+            msk_time_str_from_db = req['requested_checkin_time']
+            
+            # Шаг 2: Превращаем ее в "наивный" объект времени
+            naive_dt = datetime.strptime(msk_time_str_from_db, '%Y-%m-%d %H:%M:%S')
+            
+            # Шаг 3: Локализуем его как московское время. Никаких конвертаций.
+            checkin_time = MOSCOW_TZ.localize(naive_dt)
             final_message_action = "одобрена"
+            # --- КОНЕЦ ГЛАВНОГО ИСПРАВЛЕНИЯ ---
 
 
         db.approve_manual_checkin_request(req['request_id'], admin_id, checkin_time, req['user_id'], req['application_department'])
         time_str = checkin_time.strftime('%d.%m.%Y %H:%M')
         
-        # РЕДАКТИРУЕМ сообщение в финальный результат и убираем кнопки
         await query.edit_message_text(f"✅ Заявка от <b>{user_info}</b> {final_message_action} на время <b>{time_str}</b>.", parse_mode=ParseMode.HTML, reply_markup=None)
         await context.bot.send_message(req['user_id'], f"✅ Ваша заявка одобрена. Установленное время: {time_str}")
 
