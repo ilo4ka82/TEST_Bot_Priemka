@@ -763,11 +763,27 @@ manual_checkin_conv_handler = ConversationHandler(
 
 
 async def notify_admins_new_manual_request(bot: Bot, requesting_user: User, requested_time: datetime):
-    """Уведомляет администраторов о новой заявке на ручную отметку прихода."""
+    """Уведомляет администраторов, ИСПОЛЬЗУЯ ФИО ИЗ БАЗЫ ДАННЫХ."""
     logger.info(f"Подготовка уведомления администраторам о заявке от user_id={requesting_user.id}")
     
-    # Твоя правильная логика определения сектора
+    # Шаг 1: Получаем полные данные пользователя из нашей базы.
     user_profile_row = db.get_user(requesting_user.id)
+    
+    # --- НАЧАЛО ГЛАВНОГО ИСПРАВЛЕНИЯ ---
+    # Шаг 2: Определяем, какое имя использовать.
+    if user_profile_row and user_profile_row.get('application_full_name'):
+        # Приоритет: официальное ФИО из нашей базы.
+        display_name = user_profile_row['application_full_name']
+    else:
+        # Запасной вариант: имя из профиля Telegram.
+        display_name = requesting_user.full_name
+        logger.warning(f"Не найдено ФИО в базе для user_id={requesting_user.id}. Используется имя из Telegram.")
+    
+    full_name_escaped = escape_markdown_v2(display_name)
+    # --- КОНЕЦ ГЛАВНОГО ИСПРАВЛЕНИЯ ---
+
+
+    # Твоя правильная логика определения сектора (остается без изменений)
     department_name = "Не указан"
     if user_profile_row and user_profile_row.get('application_department'):
         dept_key_from_db = user_profile_row['application_department']
@@ -779,22 +795,20 @@ async def notify_admins_new_manual_request(bot: Bot, requesting_user: User, requ
                 break
         if not found_display_name:
             department_name = dept_key_from_db
-            logger.warning(f"Для ключа сектора '{dept_key_from_db}' пользователя {requesting_user.id} не найдено отображаемое имя в PREDEFINED_SECTORS.")
     
     username_escaped = escape_markdown_v2(requesting_user.username or "N/A")
-    full_name_escaped = escape_markdown_v2(requesting_user.full_name)
     department_name_escaped = escape_markdown_v2(department_name)
     requested_time_str_display = requested_time.strftime('%d.%m.%Y %H:%M')
     requested_time_str_escaped = escape_markdown_v2(requested_time_str_display)
 
 
+    # Используем новое `full_name_escaped` в сообщении
     message_text = (
         f"‼️ Новая заявка на ручную отметку прихода\\!\n\n"
-        f"👤 **Пользователь:** {full_name_escaped} \\(@{username_escaped}\\)\n"
+        f"👤 **Сотрудник:** {full_name_escaped} \\(@{username_escaped}\\)\n"
         f"🆔 **Telegram ID:** `{requesting_user.id}`\n"
         f"🏢 **Зарегистрированный сектор:** {department_name_escaped}\n"
         f"⏰ **Запрошенное время прихода:** *{requested_time_str_escaped}*\n\n"
-        # --- ГЛАВНОЕ ИСПРАВЛЕНИЕ: Убираем ` и устаревший текст ---
         f"Для обработки заявок используйте команду /admin\\_manual\\_checkins\\."
     )
     
@@ -817,13 +831,7 @@ async def notify_admins_new_manual_request(bot: Bot, requesting_user: User, requ
 
 
 async def admin_manual_checkins_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Начинает диалог: показывает список ожидающих заявок С ИМЕНАМИ."""
-    # Этот блок не меняется, он правильный
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("Эта команда доступна только для администраторов.")
-        return ConversationHandler.END
-
-
+    """Начинает диалог: показывает список ожидающих заявок с ФИО из базы."""
     pending_requests = db.get_pending_manual_checkin_requests()
     if not pending_requests:
         await update.message.reply_text("На данный момент нет ожидающих заявок на ручную отметку.")
@@ -832,36 +840,30 @@ async def admin_manual_checkins_start(update: Update, context: ContextTypes.DEFA
 
     message_text = "<b>Ожидающие заявки на ручную отметку:</b>"
     keyboard = []
-    for i, req in enumerate(pending_requests):
-        # --- НАЧАЛО ГЛАВНОГО ИЗМЕНЕНИЯ: ФОРМИРУЕМ ИМЯ И ТЕКСТ КНОПКИ ---
-        # Безопасно получаем имя и фамилию из словаря req
-        first_name = req.get('first_name', '') or ''
-        last_name = req.get('last_name', '') or ''
+    for req in pending_requests:
+        # --- НАЧАЛО ГЛАВНОГО ИСПРАВЛЕНИЯ: ИСПОЛЬЗУЕМ ФИО ИЗ БАЗЫ ---
+        # Приоритет: официальное ФИО. Запасной вариант: username.
+        display_name = req.get('application_full_name') or f"@{req.get('username', 'N/A')}"
         
-        # Собираем полное имя, убирая лишние пробелы, если фамилии нет
-        user_info = f"{first_name} {last_name}".strip()
-        
-        # Если имя все равно пустое (например, у пользователя нет ни имени, ни фамилии),
-        # используем username как запасной вариант.
-        if not user_info:
-            user_info = f"@{req.get('username', 'N/A')}"
-            
-        # Создаем новый, информативный текст для кнопки, как ты и просил
-        button_text = f"Заявка №{i+1} от {user_info}"
-        
-        keyboard.append([
-            InlineKeyboardButton(button_text, callback_data=f"admin_process_req_{req['request_id']}")
-        ])
-        # --- КОНЕЦ ГЛАВНОГО ИЗМЕНЕНИЯ ---
+        try:
+            time_obj = datetime.strptime(req['requested_checkin_time'], '%Y-%m-%d %H:%M:%S')
+            time_str = time_obj.strftime('%d.%m %H:%M')
+        except (TypeError, ValueError):
+            time_str = "???"
+
+
+        button_text = f"{display_name} на {time_str}"
+        # --- КОНЕЦ ГЛАВНОГО ИСПРАВЛЕНИЯ ---
+        keyboard.append([InlineKeyboardButton(button_text, callback_data=f"admin_process_req_{req['request_id']}")])
     
-    # Этот блок тоже не меняется
     keyboard.append([InlineKeyboardButton("✅ Принять все", callback_data="admin_approve_all")])
     keyboard.append([InlineKeyboardButton("Отмена", callback_data="admin_cancel_manual_dialog")])
     
+    reply_markup = InlineKeyboardMarkup(keyboard)
     if update.message:
-        await update.message.reply_text(message_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.HTML)
+        await update.message.reply_text(message_text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
     elif update.callback_query:
-        await update.callback_query.edit_message_text(message_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.HTML)
+        await update.callback_query.edit_message_text(message_text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
 
 
     return ADMIN_LIST_MANUAL_REQUESTS
@@ -925,22 +927,24 @@ async def approve_all_requests_callback(update: Update, context: ContextTypes.DE
 
 async def admin_select_manual_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """
-    Показывает детали одной заявки и кнопки для действий.
-    ТЕПЕРЬ ПРАВИЛЬНО ОТОБРАЖАЕТ МОСКОВСКОЕ ВРЕМЯ ИЗ БАЗЫ.
+    Показывает детали одной заявки. ТЕПЕРЬ УСТОЙЧИВА к вызову с разных экранов.
     """
     query = update.callback_query
     await query.answer()
 
 
-    # Этот блок для получения ID правильный
+    # --- НАЧАЛО ГЛАВНОГО ИСПРАВЛЕНИЯ: ГИБКОЕ ПОЛУЧЕНИЕ ID ---
     try:
+        # Попытка №1: Получить ID из callback_data (стандартный путь из списка)
         request_id = int(query.data.split('_')[-1])
-    except ValueError:
-        req_data = context.user_data.get('current_manual_request')
-        if not req_data:
-            await query.edit_message_text("Ошибка: данные о заявке потеряны. Начните заново.", reply_markup=None)
+    except (ValueError, IndexError):
+        # Попытка №2: Если не вышло (например, data='..._back'), берем ID из памяти.
+        req_data_from_memory = context.user_data.get('current_manual_request')
+        if not req_data_from_memory:
+            await query.edit_message_text("Ошибка: данные о заявке утеряны. Начните заново с /admin_manual_checkins.", reply_markup=None)
             return ConversationHandler.END
-        request_id = req_data['request_id']
+        request_id = req_data_from_memory['request_id']
+    # --- КОНЕЦ ГЛАВНОГО ИСПРАВЛЕНИЯ ---
 
 
     req = db.get_manual_checkin_request_by_id(request_id)
@@ -948,41 +952,35 @@ async def admin_select_manual_request(update: Update, context: ContextTypes.DEFA
 
     if not req or req['status'] != 'pending':
         await query.edit_message_text("Эта заявка уже обработана или не найдена.", reply_markup=None)
-        return ConversationHandler.END
+        # Очищаем память, чтобы не было проблем при следующем заходе
+        context.user_data.pop('current_manual_request', None)
+        return await admin_manual_checkins_start(update, context) # Возвращаемся к списку
 
 
-    context.user_data['current_manual_request'] = dict(req)
-    user_info = f"{req.get('first_name', '')} {req.get('last_name', '')} (@{req.get('username', 'N/A')})".strip()
+    context.user_data['current_manual_request'] = req
 
 
-    # --- НАЧАЛО ГЛАВНОГО ИСПРАВЛЕНИЯ: УПРОЩАЕМ ОТОБРАЖЕНИЕ ВРЕМЕНИ ---
+    display_name = req.get('application_full_name') or f"@{req.get('username', 'N/A')}"
+
+
     try:
-        # Шаг 1: Берем строку МСК из базы (например, '... 07:00:00')
-        msk_time_str_from_db = req['requested_checkin_time']
-        
-        # Шаг 2: Превращаем ее в "наивный" объект времени
-        naive_dt = datetime.strptime(msk_time_str_from_db, '%Y-%m-%d %H:%M:%S')
-        
-        # Шаг 3: Просто форматируем его для вывода. Никаких конвертаций.
+        naive_dt = datetime.strptime(req['requested_checkin_time'], '%Y-%m-%d %H:%M:%S')
         display_time = naive_dt.strftime('%d.%m.%Y в %H:%M')
     except (TypeError, ValueError):
-        # Ловим ошибки, если в базе что-то не так с форматом
-        logger.warning(f"Ошибка формата времени в заявке {req.get('request_id')}: {req.get('requested_checkin_time')}")
         display_time = "Ошибка формата времени"
-    # --- КОНЕЦ ГЛАВНОГО ИСПРАВЛЕНИЯ ---
 
 
     message_text = (
         f"<b>Рассмотрение заявки ID: {req['request_id']}</b>\n\n"
-        f"<b>Пользователь:</b> {user_info}\n"
+        f"<b>Сотрудник:</b> {display_name}\n"
         f"<b>Сектор:</b> {req.get('application_department') or 'Не указан'}\n"
         f"<b>Запрошенное время (МСК):</b> {display_time}\n\n"
         "Выберите действие:"
     )
     keyboard = [
-        [InlineKeyboardButton("✅ Одобрить как есть", callback_data="admin_req_approve_as_is")],
-        [InlineKeyboardButton("🕒 Одобрить с другим временем", callback_data="admin_req_change_time")],
-        [InlineKeyboardButton("❌ Отклонить", callback_data="admin_req_reject")],
+        [InlineKeyboardButton("✅ Одобрить как есть", callback_data=f"admin_req_approve_as_is_{req['request_id']}")],
+        [InlineKeyboardButton("🕒 Одобрить с другим временем", callback_data=f"admin_req_change_time_{req['request_id']}")],
+        [InlineKeyboardButton("❌ Отклонить", callback_data=f"admin_req_reject_{req['request_id']}")],
         [InlineKeyboardButton("« Назад к списку", callback_data="admin_req_back_to_list")]
     ]
     await query.edit_message_text(message_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.HTML)
@@ -1052,44 +1050,41 @@ async def admin_confirm_decision_prompt(update: Update, context: ContextTypes.DE
 
 async def admin_receive_new_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """
-    Обрабатывает введенное админом новое время, 
-    и СРАЗУ ЖЕ отправляет сообщение с подтверждением и кнопками.
+    Обрабатывает новое время от админа и формирует подтверждение с ФИО из базы.
     """
     user_input_time_str = update.message.text
     try:
-        # Шаг 1: Бот "ловит" этот текст и проверяет формат.
+        # Валидация и обработка времени (эта часть кода у тебя правильная)
         new_time_dt = datetime.strptime(user_input_time_str, '%d.%m.%Y %H:%M')
-        
-        # Шаг 2: Делаем время "осведомленным" и сохраняем его в память.
         aware_new_time = MOSCOW_TZ.localize(new_time_dt)
         context.user_data['new_time_from_admin'] = aware_new_time
-        context.user_data['admin_action'] = 'approve_new_time' # Помечаем, что это смена времени
+        context.user_data['admin_action'] = 'approve_new_time'
         
-        # Шаг 3: Формируем новое сообщение с подтверждением.
         req = context.user_data.get('current_manual_request')
-        user_info = f"{req.get('first_name', '')} {req.get('last_name', '')} (@{req.get('username', 'N/A')})".strip()
         
-        message = f"Одобрить заявку для <b>{user_info}</b> с новым временем <b>{aware_new_time.strftime('%d.%m.%Y %H:%M')}</b> (МСК)?"
+        # --- НАЧАЛО ГЛАВНОГО ИСПРАВЛЕНИЯ: ИСПОЛЬЗУЕМ ФИО ИЗ БАЗЫ ---
+        # Приоритет: официальное ФИО из данных, которые мы уже получили от базы.
+        # Запасной вариант: username.
+        display_name = req.get('application_full_name') or f"@{req.get('username', 'N/A')}"
+        # --- КОНЕЦ ГЛАВНОГО ИСПРАВЛЕНИЯ ---
+        
+        message = f"Одобрить заявку для <b>{display_name}</b> с новым временем <b>{aware_new_time.strftime('%d.%m.%Y %H:%M')}</b> (МСК)?"
         keyboard = [[InlineKeyboardButton("✅ Да", callback_data="admin_confirm_final_yes"), InlineKeyboardButton("❌ Нет", callback_data="admin_confirm_final_no_back")]]
         
-        # Шаг 4: ОТПРАВЛЯЕМ ЭТО НОВОЕ СООБЩЕНИЕ.
         await update.message.reply_text(
             text=message,
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode=ParseMode.HTML
         )
         
-        # Шаг 5: Диалог переходит в финальное состояние ожидания подтверждения.
         return ADMIN_CONFIRM_REQUEST_DECISION
 
 
     except ValueError:
-        # Если формат неверный, просим ввести снова.
         await update.message.reply_text(
             "❌ Неверный формат.\nПожалуйста, введите время как <code>ДД.ММ.ГГГГ ЧЧ:ММ</code>.",
             parse_mode=ParseMode.HTML
         )
-        # Остаемся в том же состоянии для повторного ввода.
         return ADMIN_ENTER_NEW_TIME
 
 
@@ -1983,16 +1978,18 @@ async def process_custom_date_end(update: Update, context: ContextTypes.DEFAULT_
 
 
 @admin_required
-async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """
+    Эта команда, будучи вызванной из `fallbacks` диалога,
+    принудительно завершает его и очищает user_data.
+    """
     user_id = update.effective_user.id
-    await update.message.reply_text(escape_markdown_v2("♻️ Перезапуск бота..."), parse_mode=ParseMode.MARKDOWN_V2)
-    logger.info(f"Бот перезапускается администратором {user_id} ({update.effective_user.username})")
-    try:
-        await context.application.updater.stop()
-        os.execv(sys.executable, ['python'] + sys.argv)
-    except Exception as e:
-        logger.error(f"Ошибка при попытке перезапуска: {e}")
-        await update.message.reply_text(escape_markdown_v2(f"⚠️ Не удалось автоматически перезапустить бота. Ошибка: {e}"), parse_mode=ParseMode.MARKDOWN_V2)
+    context.user_data.clear()
+    await update.message.reply_text("✅ Ваш диалог был успешно сброшен. Можете начинать заново.")
+    logger.info(f"Пользователь {user_id} принудительно сбросил свой диалог с помощью /restart.")
+    
+    # Возвращаем константу, которая ГАРАНТИРОВАННО завершает любой диалог
+    return ConversationHandler.END
 
 @admin_required
 async def admin_authorize_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2479,8 +2476,22 @@ async def set_bot_commands(application: Application):
 def main() -> None:
     db.init_db() 
 
+
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
+
+    # Определяем нашу новую, простую команду /restart
+    # Эта функция теперь будет использоваться во всех fallbacks
+    async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        user_id = update.effective_user.id
+        context.user_data.clear()
+        await update.message.reply_text("✅ Ваш диалог был успешно сброшен. Можете начинать заново.")
+        logger.info(f"Пользователь {user_id} принудительно сбросил свой диалог с помощью /restart.")
+        return ConversationHandler.END
+
+
+    # --- НАЧАЛО ГЛАВНОГО ИСПРАВЛЕНИЯ: Добавляем restart_command в fallbacks ---
+    
     application_conv_handler = ConversationHandler(
         entry_points=[CallbackQueryHandler(button_callback_handler, pattern='^apply_for_access$')],
         states={
@@ -2490,11 +2501,15 @@ def main() -> None:
                 CallbackQueryHandler(process_department_selection, pattern='^reg_cancel_direct$')
             ],
         },
-        fallbacks=[CommandHandler('cancel_application', cancel_application_dialog)],
+        fallbacks=[
+            CommandHandler('cancel_application', cancel_application_dialog),
+            CommandHandler('restart', restart_command) # <-- ИЗМЕНЕНИЕ
+        ],
         name="application_flow", 
         per_user=True, 
         per_chat=True
     )
+
 
     export_conv_handler = ConversationHandler(
         entry_points=[CommandHandler("admin_export_attendance", start_export_dialog)],
@@ -2519,12 +2534,14 @@ def main() -> None:
         },
         fallbacks=[
             CommandHandler("cancel_export", cancel_export_dialog),
-            CallbackQueryHandler(cancel_export_dialog, pattern="^export_cancel_dialog$")
+            CallbackQueryHandler(cancel_export_dialog, pattern="^export_cancel_dialog$"),
+            CommandHandler('restart', restart_command) # <-- ИЗМЕНЕНИЕ
         ],
         name="export_flow",
         per_user=True,
         per_chat=True
     )
+
 
     manual_checkin_conv_handler = ConversationHandler(
         entry_points=[CommandHandler("request_manual_checkin", request_manual_checkin_start)],
@@ -2533,11 +2550,15 @@ def main() -> None:
                 MessageHandler(filters.TEXT & ~filters.COMMAND, process_manual_checkin_time)
             ],
         },
-        fallbacks=[CommandHandler("cancel_manual_checkin", cancel_manual_checkin_dialog)],
+        fallbacks=[
+            CommandHandler("cancel_manual_checkin", cancel_manual_checkin_dialog),
+            CommandHandler('restart', restart_command) # <-- ИЗМЕНЕНИЕ
+        ],
         name="manual_checkin_request_flow",
         per_user=True,
         per_chat=True
     )
+
 
     admin_manual_checkins_conv_handler = ConversationHandler(
         entry_points=[CommandHandler("admin_manual_checkins", admin_manual_checkins_start)],
@@ -2559,22 +2580,29 @@ def main() -> None:
         fallbacks=[
             CommandHandler("cancel", admin_cancel_manual_checkins_dialog),
             CallbackQueryHandler(admin_cancel_manual_checkins_dialog, pattern="^admin_cancel_manual_dialog$"),
-            CommandHandler("admin_manual_checkins", admin_manual_checkins_start)
+            CommandHandler("admin_manual_checkins", admin_manual_checkins_start),
+            CommandHandler('restart', restart_command) # <-- ИЗМЕНЕНИЕ
         ],
         name="admin_manual_checkins_flow",
         per_user=True, 
         per_chat=True, 
     )
     
+    # Добавляем все обработчики в приложение
     application.add_handler(admin_manual_checkins_conv_handler) 
     application.add_handler(application_conv_handler)
     application.add_handler(export_conv_handler)
     application.add_handler(manual_checkin_conv_handler) 
 
+
+    # Удаляем старый, неработающий блок с bot_data
+    
+    # Регистрируем остальные команды
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("checkin", checkin_command))
     application.add_handler(CommandHandler("checkout", checkout_command))
+    # Важно: Глобальный /restart нужен, если пользователь НЕ в диалоге, но хочет сбросить данные
     application.add_handler(CommandHandler("restart", restart_command)) 
     application.add_handler(CommandHandler("on_shift", on_shift_command, filters=AdminFilter()))
     application.add_handler(CommandHandler("admin_authorize", admin_authorize_command))
@@ -2589,8 +2617,10 @@ def main() -> None:
         await set_bot_commands(app)
     application.post_init = post_init_hook
 
+
     logger.info("Бот запущен и готов к работе...")
     application.run_polling()
+
 
 if __name__ == "__main__":
     main()

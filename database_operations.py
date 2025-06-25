@@ -564,13 +564,12 @@ def add_manual_checkin_request(user_id: int, requested_checkin_time: datetime) -
 
 def get_pending_manual_checkin_requests() -> list:
     """
-    Возвращает список ожидающих ручных заявок в виде СЛОВАРЕЙ, 
-    объединенный с данными пользователя.
+    Возвращает список ожидающих заявок, объединенный с ПРАВИЛЬНЫМ ФИО пользователя.
     """
     conn = None
     try:
         conn = get_db_connection()
-        conn.row_factory = sqlite3.Row # Это оставляем, это полезно
+        conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         
         sql_query = """
@@ -579,26 +578,21 @@ def get_pending_manual_checkin_requests() -> list:
                 req.user_id,
                 req.requested_checkin_time,
                 req.request_timestamp,
-                u.first_name,
-                u.last_name,
-                u.username,
-                u.application_department
+                u.application_full_name, -- <-- ГЛАВНОЕ ИЗМЕНЕНИЕ: Запрашиваем ФИО
+                u.username
             FROM manual_checkin_requests req
-            JOIN users u ON req.user_id = u.telegram_id
+            LEFT JOIN users u ON req.user_id = u.telegram_id -- Используем LEFT JOIN на случай, если юзера нет
             WHERE req.status = 'pending'
             ORDER BY req.request_timestamp ASC
         """
         
         cursor.execute(sql_query)
-        requests_rows = cursor.fetchall() # Получаем список sqlite3.Row
-        
-        # --- КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: Превращаем каждый sqlite3.Row в обычный dict ---
+        requests_rows = cursor.fetchall()
         requests_dicts = [dict(row) for row in requests_rows]
-        # --------------------------------------------------------------------------
 
 
         logger.info(f"DB: Найдено {len(requests_dicts)} ожидающих заявок на ручную отметку.")
-        return requests_dicts # Возвращаем список словарей
+        return requests_dicts
         
     except sqlite3.Error as e:
         logger.error(f"DB_ERROR: Ошибка при получении списка ручных заявок: {e}", exc_info=True)
@@ -695,12 +689,12 @@ def approve_all_pending_manual_checkins(admin_id: int) -> tuple[list, int]:
 
 def get_manual_checkin_request_by_id(request_id: int):
     """
-    Возвращает детали конкретной заявки в виде СЛОВАРЯ.
+    Возвращает детали конкретной заявки, объединенные с ПРАВИЛЬНЫМ ФИО пользователя.
     """
     conn = None
     try:
         conn = get_db_connection()
-        conn.row_factory = sqlite3.Row # Это оставляем
+        conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         
         cursor.execute("""
@@ -709,25 +703,22 @@ def get_manual_checkin_request_by_id(request_id: int):
                 mcr.user_id, 
                 mcr.requested_checkin_time,
                 mcr.status,
+                u.application_full_name, -- <-- ГЛАВНОЕ ИЗМЕНЕНИЕ: Запрашиваем ФИО
                 u.username,
-                u.first_name,
-                u.last_name,
                 u.application_department
             FROM manual_checkin_requests mcr
-            JOIN users u ON mcr.user_id = u.telegram_id
+            LEFT JOIN users u ON mcr.user_id = u.telegram_id -- Используем LEFT JOIN
             WHERE mcr.request_id = ?
         """, (request_id,))
         
-        request_data_row = cursor.fetchone() # Получаем sqlite3.Row или None
+        request_data_row = cursor.fetchone()
         
-        # --- КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: Превращаем sqlite3.Row в dict ---
         if request_data_row:
             logger.info(f"DB: Получена заявка на ручную отметку с ID={request_id}.")
-            return dict(request_data_row) # Возвращаем СЛОВАРЬ
+            return dict(request_data_row)
         else:
             logger.warning(f"DB: Заявка на ручную отметку с ID={request_id} не найдена.")
-            return None # Если ничего не найдено, возвращаем None
-        # -----------------------------------------------------------------
+            return None
 
 
     except sqlite3.Error as e:
