@@ -991,35 +991,43 @@ async def admin_select_manual_request(update: Update, context: ContextTypes.DEFA
 
 async def admin_process_request_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """
-    Обрабатывает выбор действия.
-    ТЕПЕРЬ ПРАВИЛЬНО ИЗВЛЕКАЕТ 'change_time' ИЗ CALLBACK_DATA.
+    Обрабатывает выбор действия, ТЕПЕРЬ ПРАВИЛЬНО РАЗБИРАЯ CALLBACK_DATA.
     """
     query = update.callback_query
     await query.answer()
 
 
-    # --- НАЧАЛО ГЛАВНОГО ИСПРАВЛЕНИЯ ---
-    # Мы больше не делим по '_'. Мы просто отрезаем префикс.
-    # Это правильно обработает и 'approve_as_is', и 'change_time'.
-    action = query.data.replace("admin_req_", "") 
+    # --- НАЧАЛО ГЛАВНОГО ИСПРАВЛЕНИЯ: ПРАВИЛЬНЫЙ ПАРСИНГ ---
+    # callback_data имеет формат: admin_req_{action}_{request_id}
+    # или для кнопки "назад": admin_req_back_to_list
+    parts = query.data.split('_')
+    
+    # parts[0] = 'admin', parts[1] = 'req'
+    action = parts[2] 
+    if len(parts) > 3:
+        request_id = parts[3]
+        # Можно даже сохранить ID здесь на всякий случай, если он понадобится
+        # context.user_data.get('current_manual_request')['request_id'] = int(request_id)
+    
     context.user_data['admin_action'] = action
     # --- КОНЕЦ ГЛАВНОГО ИСПРАВЛЕНИЯ ---
     
-    if action == "back_to_list":
+    if action == "back": # Обрабатываем 'admin_req_back_to_list'
         return await admin_manual_checkins_start(update, context)
 
 
-    if action == "change_time":
-        # ТЕПЕРЬ ЭТОТ БЛОК НАКОНЕЦ-ТО СРАБОТАЕТ
+    if action == "change": # Обрабатываем 'admin_req_change_time_...'
         req = context.user_data.get('current_manual_request')
-        user_info = f"{req.get('first_name', '')} {req.get('last_name', '')} (@{req.get('username', 'N/A')})".strip()
+        # Используем наше новое, правильное отображение имени
+        display_name = req.get('application_full_name') or f"@{req.get('username', 'N/A')}"
         await query.edit_message_text(
-            f"Введите новое время для <b>{user_info}</b> в формате <code>ДД.ММ.ГГГГ ЧЧ:ММ</code> (например, 23.06.2025 09:00).",
+            f"Введите новое время для <b>{display_name}</b> в формате <code>ДД.ММ.ГГГГ ЧЧ:ММ</code> (например, 23.06.2025 09:00).",
             parse_mode=ParseMode.HTML
         )
         return ADMIN_ENTER_NEW_TIME
     
-    # Для 'approve_as_is' и 'reject' вызываем подтверждение
+    # Для 'approve' и 'reject' вызываем универсальное подтверждение
+    # Мы передадим `action` в следующую функцию через context
     return await admin_confirm_decision_prompt(update, context)
 
 
