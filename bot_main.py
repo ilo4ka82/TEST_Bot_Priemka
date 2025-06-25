@@ -870,35 +870,56 @@ async def admin_manual_checkins_start(update: Update, context: ContextTypes.DEFA
 
 async def approve_all_requests_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """
-    Обрабатывает нажатие на кнопку "Принять все".
+    Обрабатывает "Принять все" и РАССЫЛАЕТ УВЕДОМЛЕНИЯ пользователям.
     """
     query = update.callback_query
-    await query.answer() # Убираем "часики"
+    await query.answer(text="Начинаю массовое одобрение...", cache_time=2)
 
 
     admin_user = query.from_user
     logger.info(f"Админ {admin_user.id} нажал на кнопку 'Принять все'.")
 
 
-    # --- ВОТ ОНО, ГЛАВНОЕ ИСПРАВЛЕНИЕ ---
-    # Мы передаем ID админа в функцию, как она теперь требует
-    approved_count, failed_count = db.approve_all_pending_manual_checkins(admin_user.id)
-    # -------------------------------------
+    # Функция из DB теперь возвращает список одобренных для уведомления
+    approved_list, failed_count = db.approve_all_pending_manual_checkins(admin_user.id)
+    approved_count = len(approved_list)
+
+
+    # --- НАЧАЛО ГЛАВНОГО ИСПРАВЛЕНИЯ: ЦИКЛ УВЕДОМЛЕНИЙ ---
+    sent_notifications = 0
+    for approval_data in approved_list:
+        try:
+            user_id = approval_data['user_id']
+            
+            # Превращаем строку времени в объект для красивого форматирования
+            naive_dt = datetime.strptime(approval_data['checkin_time_str'], '%Y-%m-%d %H:%M:%S')
+            time_str_for_user = naive_dt.strftime('%d.%m.%Y %H:%M')
+
+
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"✅ Ваша заявка на ручную отметку одобрена. Установленное время: {time_str_for_user}"
+            )
+            sent_notifications += 1
+        except Forbidden:
+            logger.warning(f"Массовое одобрение: Не удалось отправить уведомление пользователю {user_id}, т.к. бот заблокирован.")
+        except Exception as e:
+            logger.error(f"Массовое одобрение: Не удалось отправить уведомление пользователю {user_id}: {e}")
+    # --- КОНЕЦ ГЛАВНОГО ИСПРАВЛЕНИЯ ---
 
 
     if approved_count == 0 and failed_count == 0:
         response_text = "Не найдено заявок для обработки."
     else:
-        response_text = f"✅ Массовое одобрение завершено!\n\n" \
-                        f"Успешно обработано: {approved_count} шт.\n" \
-                        f"Пропущено из-за ошибок: {failed_count} шт."
+        response_text = (
+            f"✅ Массовое одобрение завершено!\n\n"
+            f"Успешно обработано: {approved_count} шт.\n"
+            f"Отправлено уведомлений: {sent_notifications} шт.\n"
+            f"Пропущено из-за ошибок: {failed_count} шт."
+        )
 
 
-    # Редактируем исходное сообщение, убирая клавиатуру
     await query.edit_message_text(text=response_text)
-
-
-    # Завершаем диалог
     return ConversationHandler.END
 
 

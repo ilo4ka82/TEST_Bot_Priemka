@@ -607,58 +607,85 @@ def get_pending_manual_checkin_requests() -> list:
         if conn:
             conn.close()
 
-def approve_all_pending_manual_checkins(admin_id: int) -> tuple[int, int]:
+def approve_all_pending_manual_checkins(admin_id: int) -> tuple[list, int]:
     """
-    Одобряет все ожидающие ручные заявки в рамках одной транзакции.
-    Возвращает кортеж (количество успешных, количество неуспешных).
+    Одобряет все ожидающие заявки.
+    Возвращает список словарей с данными одобренных заявок и количество ошибок.
     """
     conn = None
-    approved_count = 0
-    failed_count = 0
-    
     try:
-        # Получаем все заявки для обработки
-        pending_requests = get_pending_manual_checkin_requests()
-        if not pending_requests:
-            return (0, 0)
-
-
         conn = get_db_connection()
         cursor = conn.cursor()
+
+
+        # Сначала получаем список всех заявок, которые мы будем обрабатывать
+        cursor.execute("SELECT * FROM manual_checkin_requests WHERE status = 'pending'")
+        pending_requests = [dict(row) for row in cursor.fetchall()]
+
+
+        if not pending_requests:
+            return [], 0
+
+
+        approved_requests_data = []
+        failed_count = 0
         
-        processed_time_str = datetime.now(MOSCOW_TZ).strftime('%Y-%m-%d %H:%M:%S')
+        processed_time_msk_str = datetime.now(MOSCOW_TZ).strftime('%Y-%m-%d %H:%M:%S')
 
 
         for req in pending_requests:
             try:
-                # Шаг 1: Добавляем рабочую сессию
-                cursor.execute(
-                    "INSERT INTO work_sessions (telegram_id, check_in_time, checkin_type, sector_id) VALUES (?, ?, 'manual_admin', ?)",
-                    (req['user_id'], req['requested_checkin_time'], req['application_department'])
-                )
+                # ВАЖНО: Мы работаем внутри одной транзакции
+                request_id = req['request_id']
+                user_id = req['user_id']
                 
-                # --- ГЛАВНОЕ ИСПРАВЛЕНИЕ: МЕНЯЕМ ИМЯ СТОЛБЦА ---
-                cursor.execute(
-                    "UPDATE manual_checkin_requests SET status = 'approved', admin_id_processed = ?, processed_timestamp = ? WHERE request_id = ?",
-                    (admin_id, processed_time_str, req['request_id'])
-                )
-                # -------------------------------------------------
+                # Время уже в виде строки МСК, берем его как есть
+                checkin_time_str = req['requested_checkin_time']
                 
-                approved_count += 1
+                # 1. Обновляем саму заявку
+                cursor.execute("""
+                    UPDATE manual_checkin_requests
+                    SET status = 'approved', admin_id_processed = ?, processed_timestamp = ?, final_checkin_time = ?
+                    WHERE request_id = ?
+                """, (admin_id, processed_time_msk_str, checkin_time_str, request_id))
+
+
+                # 2. Создаем рабочую сессию
+                # Нам нужен sector_id пользователя для создания сессии
+                user_cursor = conn.cursor()
+                user_cursor.execute("SELECT application_department FROM users WHERE telegram_id = ?", (user_id,))
+                user_data = user_cursor.fetchone()
+                user_sector_key = user_data['application_department'] if user_data else 'unknown'
+
+
+                cursor.execute("""
+                    INSERT INTO work_sessions (telegram_id, check_in_time, checkin_type, sector_id)
+                    VALUES (?, ?, 'manual_admin', ?)
+                """, (user_id, checkin_time_str, user_sector_key))
+
+
+                # Если все успешно, добавляем данные для отправки уведомления
+                approved_requests_data.append({
+                    'user_id': user_id,
+                    'checkin_time_str': checkin_time_str
+                })
+                logger.info(f"Массовое одобрение: Заявка {request_id} для user_id={user_id} успешно обработана.")
+
+
             except sqlite3.Error as e:
-                logger.error(f"DB_ERROR: Ошибка при массовом одобрении заявки {req['request_id']}: {e}")
+                logger.error(f"Массовое одобрение: Ошибка при обработке заявки {req.get('request_id')}: {e}")
                 failed_count += 1
+                # Мы не откатываем транзакцию, чтобы успешные заявки сохранились
         
         conn.commit()
-        logger.info(f"DB: Массовое одобрение завершено админом {admin_id}. Успешно: {approved_count}, Ошибки: {failed_count}.")
-        return (approved_count, failed_count)
+        return approved_requests_data, failed_count
 
 
     except sqlite3.Error as e:
-        logger.error(f"DB_ERROR: Критическая ошибка в approve_all_pending_manual_checkins: {e}")
         if conn:
-            conn.rollback() 
-        return (0, len(pending_requests) if 'pending_requests' in locals() else 0)
+            conn.rollback()
+        logger.error(f"DB_ERROR: Критическая ошибка при массовом одобрении заявок: {e}", exc_info=True)
+        return [], len(pending_requests) if 'pending_requests' in locals() else 0
     finally:
         if conn:
             conn.close()
