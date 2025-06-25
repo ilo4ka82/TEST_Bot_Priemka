@@ -233,22 +233,61 @@ async def on_shift_button_press(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text_to_send = (
-        "📋 *Справка по боту:*\n"
-        "Этот бот помогает вести учет рабочего времени сотрудников\\.\n\n"
-        "Используйте кнопку меню \\(обычно `/` или три полоски\\) рядом с полем ввода, чтобы увидеть список доступных команд и их описания\\.\n\n"
-        "Основные команды:\n"
-        "`/start` \\- Начало работы и информация о статусе\n"
-        "`/checkin` \\- Отметить приход на работу\n"
-        "`/checkout` \\- Отметить уход с работы\n\n"
-        "Если вы неавторизованный сотрудник, используйте команду `/start` для подачи заявки на доступ\\.\n\n"
-        "Если вы администратор, вам также доступны специальные команды для управления пользователями и ботом\\."
+    """
+    Отправляет полную, контекстно-зависимую справку для пользователей и администраторов,
+    основанную на финальном утвержденном плане.
+    """
+    user_id = update.effective_user.id
+
+
+    # --- Базовый текст, который видят все ---
+    base_help_text = (
+        "Этот бот помогает вести учет рабочего времени сотрудников.\n\n"
+        "Используйте кнопку меню (обычно / или три полоски) рядом с полем ввода, чтобы увидеть список доступных команд."
     )
-    try:
-        await update.message.reply_text(text_to_send, parse_mode=ParseMode.MARKDOWN_V2)
-    except Exception as e:
-        logger.error(f"Ошибка при отправке help_command с MarkdownV2: {e}", exc_info=True)
-        await update.message.reply_text("Не удалось отобразить справку с форматированием. Попробуйте позже.")
+
+
+    # --- Блок команд для обычного пользователя ---
+    user_commands_text = (
+        "\n\n<b>Список команд:</b>\n"
+        "🚀 <code>/start</code> - Начало работы и информация о статусе.\n"
+        
+        "✅ <code>/checkin</code> - Отметить приход на работу.\n"
+        
+        "👋 <code>/checkout</code> - Отметить уход с работы.\n"
+        
+        "🛠️ <code>/request_manual_checkin</code> - Запросить ручную отметку, если забыли отметиться, либо не сработала геолокация.\n"
+        
+        "❓ <code>/help</code> - Показать это справочное сообщение."
+    )
+
+
+    # --- Блок команд ТОЛЬКО для администратора ---
+    admin_commands_text = (
+        "\n\n👑 <b>Команды администратора:</b>\n"
+        
+        "👀 <code>/on_shift</code> - Посмотреть кто на смене.\n"
+        
+        "👥 <code>/admin_pending_users</code> - Заявки на авторизацию в боте.\n"
+        
+        "📊 <code>/admin_export_attendance</code> - Экспорт отчета о посещаемости(Excel).\n"
+        
+        "🛠️ <code>/admin_manual_checkins</code> - Ручные заявки на приход.\n"
+        
+        "🔄 <code>/restart</code> - <b>Сбросить свой диалог если бот завис (не перезапускает всего бота на сервере).</b>"
+    )
+
+
+    # Собираем финальное сообщение в зависимости от роли
+    if is_admin(user_id):
+        # Админ видит всё: базу, команды пользователя и свои команды
+        text_to_send = base_help_text + user_commands_text + admin_commands_text
+    else:
+        # Обычный пользователь видит только базу и свои команды
+        text_to_send = base_help_text + user_commands_text
+
+
+    await update.message.reply_text(text_to_send, parse_mode=ParseMode.HTML)
 
 
 
@@ -2439,24 +2478,24 @@ async def set_bot_commands(application: Application):
     
     common_commands = [
         BotCommand("start", "🚀 Начало работы / Статус / Подать заявку"),
-        BotCommand("help", "ℹ️ Помощь по командам"),
+        BotCommand("help", "❓ Помощь по командам"),
     ]
     
     # Команды, доступные после авторизации (но не админские)
     authorized_user_commands = [
-        BotCommand("checkin", "➡️ Отметить приход"),
-        BotCommand("checkout", "⬅️ Отметить уход"),
+        BotCommand("checkin", "✅ Отметить приход"),
+        BotCommand("checkout", "👋 Отметить уход"),
         BotCommand("request_manual_checkin", "🛠️ Запросить ручную отметку"), # <--- ВОТ ЗДЕСЬ ДОБАВЛЯЕМ
     ]
     
     # Команды только для админов (добавляются к common и authorized)
     admin_specific_commands = [
         BotCommand("admin_authorize", "👑 Авторизовать пользователя"),
-        BotCommand("on_shift", "Посмотреть, кто на смене"),
-        BotCommand("admin_pending_users", "⏳ Заявки на доступ"),
+        BotCommand("on_shift", "👀 Посмотреть, кто на смене"),
+        BotCommand("admin_pending_users", "👥 Заявки на доступ"),
         BotCommand("admin_export_attendance", "📊 Экспорт отчета о посещаемости"),
         BotCommand("admin_manual_checkins", "🛠️ Ручные заявки на приход"),
-        BotCommand("restart", "🔄 Перезапустить бота"),
+        BotCommand("restart", "🔄 Сброс диалога(если бот завис)"),
     ]
 
     # Эта строка объединяет common_commands и (теперь обновленные) authorized_user_commands.
