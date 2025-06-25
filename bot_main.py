@@ -1641,11 +1641,10 @@ def format_seconds_to_hhmmss(seconds_val):
 
 async def generate_custom_excel_report(report_data: list, report_info: dict, selected_sector_key: str) -> bytes:
     """
-    Генерирует Excel-отчет, САМОСТОЯТЕЛЬНО ВЫЧИСЛЯЯ длительность сессий
-    и ДОБАВЛЯЯ ОТСТУПЫ между сотрудниками.
+    Генерирует Excel-отчет, с правильной сортировкой и без ошибок типов.
     """
     if not report_data:
-        # ... (эта часть остается без изменений)
+        # ... (эта часть остается без изменений) ...
         logger.info("Нет данных для генерации Excel отчета.")
         df_empty = pd.DataFrame([{"Сообщение": "Нет данных для отображения в выбранных параметрах"}])
         output = io.BytesIO()
@@ -1653,19 +1652,24 @@ async def generate_custom_excel_report(report_data: list, report_info: dict, sel
             df_empty.to_excel(writer, sheet_name="Отчет", index=False)
         return output.getvalue()
 
+
     df_all_data = pd.DataFrame(report_data)
     output = io.BytesIO()
+
 
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         def prepare_and_write_sheet(df_sheet_data, sheet_name_param):
             if df_sheet_data.empty:
                 return
 
+
             df_details = df_sheet_data.copy()
 
-            start_times = pd.to_datetime(df_details['session_start_time'], errors='coerce')
-            end_times = pd.to_datetime(df_details['session_end_time'], errors='coerce')
-            duration = end_times - start_times
+
+            df_details['session_start_time'] = pd.to_datetime(df_details['session_start_time'], errors='coerce')
+            df_details['session_end_time'] = pd.to_datetime(df_details['session_end_time'], errors='coerce')
+            
+            duration = df_details['session_end_time'] - df_details['session_start_time']
             df_details['Длительность сессии'] = duration.dt.total_seconds().apply(format_seconds_to_hhmmss)
             
             df_details.rename(columns={
@@ -1680,35 +1684,40 @@ async def generate_custom_excel_report(report_data: list, report_info: dict, sel
             existing_columns = [col for col in final_columns if col in df_details.columns]
             df_sheet_final = df_details[existing_columns]
 
-            # --- НАЧАЛО НОВОЙ ЛОГИКИ ОТСТУПОВ ---
+
+            df_sorted = df_sheet_final.sort_values(
+                by=['ФИО', 'Начало сессии'], 
+                ascending=[True, False]
+            ).reset_index(drop=True)
             
-            # Убедимся, что данные отсортированы по ФИО, это ключ к успеху
-            df_sorted = df_sheet_final.sort_values(by='ФИО').reset_index(drop=True)
+            # --- НАЧАЛО ГЛАВНОГО ИСПРАВЛЕНИЯ ---
+            # Шаг 1: Форматируем даты в строки ДО того, как добавлять пустые строки.
+            # Теперь df_sorted содержит только строки, а не смешанные типы.
+            df_sorted['Начало сессии'] = df_sorted['Начало сессии'].dt.strftime('%Y-%m-%d %H:%M:%S').replace('NaT', 'Активна')
+            df_sorted['Конец сессии'] = df_sorted['Конец сессии'].dt.strftime('%Y-%m-%d %H:%M:%S').replace('NaT', '')
+            # --- КОНЕЦ ГЛАВНОГО ИСПРАВЛЕНИЯ ---
             
             new_rows = []
             last_name = None
-            
-            # Создаем шаблон для пустой строки, чтобы сохранить структуру колонок
             blank_row = pd.Series([''] * len(df_sorted.columns), index=df_sorted.columns)
+
 
             for index, row in df_sorted.iterrows():
                 current_name = row['ФИО']
-                # Если имя сменилось (и это не первая строка), добавляем пустую строку
                 if last_name is not None and current_name != last_name:
                     new_rows.append(blank_row)
                 
-                new_rows.append(row) # Добавляем текущую строку с данными
+                new_rows.append(row)
                 last_name = current_name
             
-            # Создаем новый DataFrame из списка, который теперь содержит пустые строки
+            # Теперь мы смешиваем строки со строками, что абсолютно безопасно.
             df_with_spacing = pd.DataFrame(new_rows)
             
-            # --- КОНЕЦ НОВОЙ ЛОГИКИ ОТСТУПОВ ---
-
-            # Записываем в Excel новый DataFrame с отступами
+            # Старый блок форматирования здесь больше не нужен, мы его перенесли наверх.
+            
             df_with_spacing.to_excel(writer, sheet_name=sheet_name_param, index=False)
             
-            # ... (остальная часть функции по форматированию листа остается без изменений)
+            # ... (остальная часть функции по форматированию листа остается без изменений) ...
             worksheet = writer.book[sheet_name_param]   
             for column_cells in worksheet.columns:
                 try:
@@ -1725,7 +1734,8 @@ async def generate_custom_excel_report(report_data: list, report_info: dict, sel
                     logger.debug(f"Ошибка автоширины для столбца на листе '{sheet_name_param}': {e_width}")
             logger.info(f"Лист '{sheet_name_param}' успешно добавлен в Excel.")
 
-        # ... (остальная часть функции по разделению на листы остается без изменений)
+
+        # ... (остальная часть функции по разделению на листы остается без изменений) ...
         if selected_sector_key.upper() == 'ALL':
             if 'application_department' not in df_all_data.columns:
                 logger.error("Столбец 'application_department' отсутствует в данных, не могу разделить по секторам.")
@@ -1742,6 +1752,7 @@ async def generate_custom_excel_report(report_data: list, report_info: dict, sel
             sheet_name_base = report_info.get('sector_display_name', 'Детализация').replace(' ', '_')
             safe_sheet_name = "".join(c if c.isalnum() or c in " _-" else "_" for c in sheet_name_base)[:31]
             prepare_and_write_sheet(df_all_data, safe_sheet_name)
+
 
     logger.info("Excel-файл сгенерирован в памяти.")
     return output.getvalue()
