@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 from typing import Union, Dict 
 import pytz
 import telegram
+from telegram.error import Forbidden
 from telegram import Update, KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove, BotCommand, BotCommandScopeChat, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.constants import ParseMode
 from telegram import Update, User, Bot
@@ -1075,8 +1076,7 @@ async def admin_receive_new_time(update: Update, context: ContextTypes.DEFAULT_T
 
 async def admin_handle_final_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """
-    Обрабатывает финальное 'Да'/'Нет', ТЕПЕРЬ ПРАВИЛЬНО РАБОТАЕТ С ВРЕМЕНЕМ,
-    редактирует сообщение и завершает диалог.
+    Обрабатывает финальное 'Да'/'Нет', теперь с надежной отправкой уведомлений.
     """
     query = update.callback_query
     await query.answer()
@@ -1086,7 +1086,6 @@ async def admin_handle_final_confirmation(update: Update, context: ContextTypes.
         return await admin_select_manual_request(update, context)
 
 
-    # Если "Да", выполняем действие
     req = context.user_data.get('current_manual_request')
     action = context.user_data.get('admin_action')
     admin_id = query.from_user.id
@@ -1095,33 +1094,54 @@ async def admin_handle_final_confirmation(update: Update, context: ContextTypes.
 
     if action == "reject":
         db.reject_manual_checkin_request(req['request_id'], admin_id)
-        await query.edit_message_text(f"❌ Заявка от <b>{user_info}</b> отклонена.", parse_mode=ParseMode.HTML, reply_markup=None)
-        await context.bot.send_message(req['user_id'], "❌ Ваша заявка на ручную отметку была отклонена.")
-    
+        
+        # --- НАЧАЛО ИСПРАВЛЕНИЯ: делаем отправку надежной ---
+        try:
+            await query.edit_message_text(f"❌ Заявка от <b>{user_info}</b> отклонена.", parse_mode=ParseMode.HTML, reply_markup=None)
+        except Exception as e:
+            logger.error(f"Ошибка при редактировании сообщения для отклонения заявки {req['request_id']}: {e}")
+
+
+        try:
+            await context.bot.send_message(req['user_id'], "❌ Ваша заявка на ручную отметку была отклонена.")
+            logger.info(f"Уведомление об отклонении отправлено пользователю {req['user_id']}.")
+        except Forbidden:
+            logger.warning(f"Не удалось отправить уведомление об отклонении пользователю {req['user_id']}, т.к. бот заблокирован.")
+        except Exception as e:
+            logger.error(f"Не удалось отправить уведомление об отклонении пользователю {req['user_id']}: {e}")
+        # --- КОНЕЦ ИСПРАВЛЕНИЯ ---
+
+
     else: # 'approve_as_is' или 'approve_new_time'
+        # ... (вся твоя логика определения checkin_time остается без изменений) ...
         if action == 'approve_new_time':
-            # Этот блок уже работает правильно, т.к. 'new_time_from_admin' - это уже готовый объект МСК
             checkin_time = context.user_data.get('new_time_from_admin')
             final_message_action = "одобрена с новым временем"
-        else: # 'approve_as_is'
-            # --- НАЧАЛО ГЛАВНОГО ИСПРАВЛЕНИЯ ---
-            # Шаг 1: Берем строку МСК из базы (например, '... 07:00:00')
+        else:
             msk_time_str_from_db = req['requested_checkin_time']
-            
-            # Шаг 2: Превращаем ее в "наивный" объект времени
             naive_dt = datetime.strptime(msk_time_str_from_db, '%Y-%m-%d %H:%M:%S')
-            
-            # Шаг 3: Локализуем его как московское время. Никаких конвертаций.
             checkin_time = MOSCOW_TZ.localize(naive_dt)
             final_message_action = "одобрена"
-            # --- КОНЕЦ ГЛАВНОГО ИСПРАВЛЕНИЯ ---
 
 
         db.approve_manual_checkin_request(req['request_id'], admin_id, checkin_time, req['user_id'], req['application_department'])
         time_str = checkin_time.strftime('%d.%m.%Y %H:%M')
         
-        await query.edit_message_text(f"✅ Заявка от <b>{user_info}</b> {final_message_action} на время <b>{time_str}</b>.", parse_mode=ParseMode.HTML, reply_markup=None)
-        await context.bot.send_message(req['user_id'], f"✅ Ваша заявка одобрена. Установленное время: {time_str}")
+        # --- НАЧАЛО ИСПРАВЛЕНИЯ: делаем отправку надежной ---
+        try:
+            await query.edit_message_text(f"✅ Заявка от <b>{user_info}</b> {final_message_action} на время <b>{time_str}</b>.", parse_mode=ParseMode.HTML, reply_markup=None)
+        except Exception as e:
+            logger.error(f"Ошибка при редактировании сообщения для одобрения заявки {req['request_id']}: {e}")
+
+
+        try:
+            await context.bot.send_message(req['user_id'], f"✅ Ваша заявка на ручной приход одобрена. Установленное время: {time_str}")
+            logger.info(f"Уведомление об одобрении отправлено пользователю {req['user_id']}.")
+        except Forbidden:
+            logger.warning(f"Не удалось отправить уведомление об одобрении пользователю {req['user_id']}, т.к. бот заблокирован.")
+        except Exception as e:
+            logger.error(f"Не удалось отправить уведомление об одобрении пользователю {req['user_id']}: {e}")
+        # --- КОНЕЦ ИСПРАВЛЕНИЯ ---
 
 
     context.user_data.clear()
