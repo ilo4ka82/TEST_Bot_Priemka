@@ -1,6 +1,6 @@
 import sqlite3
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
 from pytz import utc
 from config import DATABASE_PATH
@@ -847,15 +847,34 @@ def get_unique_user_departments() -> list:
 
 def get_active_users_by_department(department: str) -> list:
     """
-    Возвращает УНИКАЛЬНЫЙ список пользователей с их САМОЙ ПОСЛЕДНЕЙ активной сессией.
-    Данные отсортированы по ДЕПАРТАМЕНТУ, а затем по ФИО.
+    Возвращает УНИКАЛЬНЫЙ список пользователей на смене с их ПОСЛЕДНЕЙ активной сессией.
+    "На смене" означает, что сессия открыта ПОСЛЕ 5 утра текущего рабочего дня.
     """
     conn = None
     try:
+        # --- НАЧАЛО НОВОЙ ЛОГИКИ: ВЫЧИСЛЕНИЕ ТОЧКИ ОТСЕЧКИ ---
+        
+        # 1. Получаем текущее время в Москве
+        now_moscow = datetime.now(MOSCOW_TZ)
+        
+        # 2. Устанавливаем время отсечки на 5 утра СЕГОДНЯШНЕГО дня
+        cutoff_time_moscow = now_moscow.replace(hour=5, minute=0, second=0, microsecond=0)
+        
+        # 3. Если сейчас раньше 5 утра (например, 4:59), то "рабочий день" еще вчерашний.
+        #    Значит, точкой отсечки должно быть 5 утра ВЧЕРА.
+        if now_moscow < cutoff_time_moscow:
+            cutoff_time_moscow -= timedelta(days=1)
+            
+        # 4. Превращаем "умный" объект времени в строку для SQL-запроса
+        cutoff_time_str = cutoff_time_moscow.strftime('%Y-%m-%d %H:%M:%S')
+
+        # --- КОНЕЦ НОВОЙ ЛОГИКИ ---
+
         conn = get_db_connection()
         conn.row_factory = sqlite3.Row 
         cursor = conn.cursor()
 
+        # --- ОБНОВЛЕННЫЙ SQL-ЗАПРОС ---
         sql_query = """
             SELECT
                 u.application_full_name,
@@ -867,20 +886,24 @@ def get_active_users_by_department(department: str) -> list:
                     telegram_id,
                     MAX(check_in_time) AS max_check_in_time
                 FROM work_sessions
-                WHERE check_out_time IS NULL
+                WHERE 
+                    check_out_time IS NULL 
+                    -- НАШЕ НОВОЕ УСЛОВИЕ "КОМЕНДАНТСКОГО ЧАСА"
+                    AND check_in_time >= ? 
                 GROUP BY telegram_id
             ) AS t
             JOIN users u ON t.telegram_id = u.telegram_id
             WHERE
                 (? = 'ALL' OR u.application_department = ?)
-            -- --- ГЛАВНОЕ ИЗМЕНЕНИЕ: СОРТИРУЕМ ПО ФИО ---
             ORDER BY
                 u.application_department, u.application_full_name ASC;
         """
         
-        cursor.execute(sql_query, (department, department))
+        # Передаем в запрос ТРИ параметра: отсечку времени и дважды департамент
+        cursor.execute(sql_query, (cutoff_time_str, department, department))
         results = cursor.fetchall()
-        logger.info(f"DB_INFO: Умный запрос вернул {len(results)} уникальных строк.")
+        
+        logger.info(f"DB_INFO: Умный запрос для /on_shift (отсечка: {cutoff_time_str}) вернул {len(results)} строк.")
         return results
 
     except sqlite3.Error as e:
@@ -889,7 +912,167 @@ def get_active_users_by_department(department: str) -> list:
     finally:
         if conn:
             conn.close()
+            
+def find_users_by_name(name_part: str) -> list:
+    """
+    Ищет пользователей в базе по части их полного имени (application_full_name).
+    Поиск нечувствителен к регистру.
+    Возвращает список словарей с telegram_id и application_full_name.
+    """
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Используем LIKE для поиска по подстроке
+        # LOWER() делает поиск нечувствительным к регистру
+        sql_query = """
+            SELECT telegram_id, application_full_name
+            FROM users
+            WHERE LOWER(application_full_name) LIKE LOWER(?)
+            AND is_authorized = 1
+            ORDER BY application_full_name;
+        """
+        
+        # Добавляем '%' к строке поиска, чтобы искать вхождения
+        search_term = f"%{name_part}%"
+        
+        cursor.execute(sql_query, (search_term,))
+        users = [dict(row) for row in cursor.fetchall()]
+        
+        logger.info(f"DB: Поиск по имени '{name_part}' нашел {len(users)} пользователей.")
+        return users
 
+    except sqlite3.Error as e:
+        logger.error(f"DB_ERROR: Ошибка при поиске пользователей по имени '{name_part}': {e}", exc_info=True)
+        return []
+    finally:
+        if conn:
+            conn.close()
+
+
+def get_completed_sessions_for_user(user_id: int, period: str) -> list:
+    """
+    (ДИАГНОСТИЧЕСКАЯ ВЕРСИЯ)
+    Эта функция распечатает КАЖДОЕ сравнение дат, чтобы мы увидели, почему оно дает сбой.
+    """
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        sql_query = """
+            SELECT session_id, check_in_time, check_out_time
+            FROM work_sessions
+            WHERE telegram_id = ? AND check_out_time IS NOT NULL
+            ORDER BY check_in_time DESC
+        """
+        
+        cursor.execute(sql_query, (user_id,))
+        all_sessions = [dict(row) for row in cursor.fetchall()]
+
+        if period == 'last5':
+            return all_sessions[:5]
+
+        elif period == 'week':
+            cutoff_date = datetime.now(MOSCOW_TZ) - timedelta(days=7)
+        elif period == 'month':
+            cutoff_date = datetime.now(MOSCOW_TZ) - timedelta(days=30)
+        else:
+            return []
+            
+        logger.info("="*50)
+        logger.info(f"НАЧАЛО ДИАГНОСТИКИ ФИЛЬТРА ДЛЯ ПЕРИОДА '{period}'")
+        logger.info(f"ДАТА ОТСЕЧКИ (cutoff_date): {cutoff_date}")
+        logger.info("="*50)
+            
+        filtered_sessions = []
+        for session in all_sessions:
+            try:
+                session_dt_naive = datetime.strptime(session['check_in_time'], '%Y-%m-%d %H:%M:%S')
+                session_dt_aware = MOSCOW_TZ.localize(session_dt_naive)
+                
+                # --- ГЛАВНЫЙ ДИАГНОСТИЧЕСКИЙ БЛОК ---
+                comparison_result = session_dt_aware >= cutoff_date
+                logger.info(f"--- СРАВНЕНИЕ ДЛЯ СЕССИИ ID {session['session_id']} ---")
+                logger.info(f"    Дата из БД (строка): {session['check_in_time']}")
+                logger.info(f"    Дата из БД (объект):  {session_dt_aware}")
+                logger.info(f"    РЕЗУЛЬТАТ СРАВНЕНИЯ (>=): {comparison_result}")
+                # --- КОНЕЦ БЛОКА ---
+
+                if comparison_result:
+                    filtered_sessions.append(session)
+            except Exception as e:
+                logger.error(f"ОШИБКА при обработке сессии ID {session['session_id']}: {e}")
+                continue
+        
+        logger.info("="*50)
+        logger.info("ДИАГНОСТИКА ФИЛЬТРА ЗАВЕРШЕНА")
+        logger.info("="*50)
+        
+        return filtered_sessions
+
+    except sqlite3.Error as e:
+        logger.error(f"DB_ERROR: Ошибка при получении сессий для {user_id}: {e}", exc_info=True)
+        return []
+    finally:
+        if conn:
+            conn.close()
+
+
+
+def update_session_checkout_time(session_id: int, new_checkout_time_str: str) -> bool:
+    """
+    Обновляет время ухода для конкретной сессии И ПЕРЕСЧИТЫВАЕТ ДЛИТЕЛЬНОСТЬ.
+    Возвравращает True в случае успеха, False в случае ошибки.
+    """
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Шаг 1: Получаем время прихода, чтобы посчитать новую длительность
+        cursor.execute("SELECT check_in_time FROM work_sessions WHERE session_id = ?", (session_id,))
+        result = cursor.fetchone()
+        if not result:
+            logger.error(f"DB_ERROR: Не удалось найти сессию {session_id} для обновления.")
+            return False
+            
+        check_in_time_str = result['check_in_time']
+        
+        # Шаг 2: Считаем новую длительность в минутах
+        check_in_dt = datetime.strptime(check_in_time_str, '%Y-%m-%d %H:%M:%S')
+        new_checkout_dt = datetime.strptime(new_checkout_time_str, '%Y-%m-%d %H:%M:%S')
+        new_duration = (new_checkout_dt - check_in_dt).total_seconds() / 60
+        new_duration_minutes = int(new_duration) # Убеждаемся, что это целое число
+
+        # Шаг 3: Обновляем ОБА поля в одной транзакции
+        sql_query = """
+            UPDATE work_sessions 
+            SET 
+                check_out_time = ?, 
+                duration_minutes = ? 
+            WHERE 
+                session_id = ?;
+        """
+        cursor.execute(sql_query, (new_checkout_time_str, new_duration_minutes, session_id))
+        conn.commit()
+        
+        if cursor.rowcount > 0:
+            logger.info(f"DB: Сессия {session_id} успешно обновлена. Новое время ухода: {new_checkout_time_str}, новая длительность: {new_duration_minutes} мин.")
+            return True
+        else:
+            logger.warning(f"DB: Не удалось обновить сессию {session_id} (rowcount = 0).")
+            return False
+
+    except (sqlite3.Error, ValueError, TypeError) as e:
+        logger.error(f"DB_ERROR: Ошибка при обновлении сессии {session_id}: {e}", exc_info=True)
+        if conn:
+            conn.rollback() # Откатываем изменения в случае ошибки
+        return False
+    finally:
+        if conn:
+            conn.close()
 
 
 

@@ -30,5 +30,10 @@ SECTOR_WEEKLY_NORMS = {
     "ОП": 40,
     "DEFAULT_NORM": 40
 }
+SECTOR_SCHEDULES = {
+    'ОП': {'start_hour': 9, 'end_hour': 18},
+    'ВИ': {'start_hour': 9, 'end_hour': 18},
+    'СС': {'start_hour': 10, 'end_hour': 19},
+}
 
 
