@@ -98,6 +98,8 @@ EDIT_AWAIT_NAME, EDIT_SELECT_USER, EDIT_SELECT_PERIOD, EDIT_SELECT_SESSION, EDIT
 
 PREDEFINED_SECTORS = ["Сектор СС", "Сектор ВИ", "Сектор ОП"]
 
+MAX_LOCATION_AGE_SECONDS = 300
+
 
 class AdminFilter(BaseFilter):
     def filter(self, message: Union[Dict, 'telegram.Message']) -> bool:
@@ -1333,20 +1335,45 @@ async def location_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     user = update.effective_user
     message = update.message
 
-    if not message.reply_to_message:
-        logger.warning(f"Пользователь {user.id} ({user.username}) отправил геолокацию без ответа на сообщение. Вероятно, это пересылка.")
-        await message.reply_text(
-            escape_markdown_v2("❌ Пересылать геолоку - крокодилий поступок! Отмечайтесь через /chekin, либо /request_manual_checkin."),
-            reply_markup=ReplyKeyboardRemove(),
-            parse_mode=ParseMode.MARKDOWN_V2
-        )
-        return
-    # --- КОНЕЦ ФИНАЛЬНОЙ ПРОВЕРКИ ---
-
     if not message or not message.location:
         logger.warning(f"location_handler вызван без объекта location для пользователя {user.id} ({user.username})")
         return
 
+    # --- ФИЛЬТР №1: ПРОВЕРКА НА ПЕРЕСЫЛКУ (ИСПРАВЛЕННАЯ ВЕРСИЯ) ---
+    if message.forward_origin:
+        logger.warning(f"Пользователь {user.id} ({user.username}) попытался переслать геолокацию.")
+        await message.reply_text(
+            escape_markdown_v2("❌ Пересылать геолокацию нельзя. Пожалуйста, отправьте вашу текущую геолокацию."),
+            reply_markup=ReplyKeyboardRemove(),
+            parse_mode=ParseMode.MARKDOWN_V2
+        )
+        return
+
+    # --- ФИЛЬТР №2: ПРОВЕРКА НА "СВЕЖЕСТЬ" ---
+    message_date = message.date
+    current_date = datetime.now(timezone.utc)
+    age = current_date - message_date
+
+    if age.total_seconds() > MAX_LOCATION_AGE_SECONDS:
+        logger.critical(
+            f"ОТКЛОНЕНА СТАРАЯ ГЕОЛОКАЦИЯ ОТ {user.id} (вероятно, iOS). "
+            f"Возраст: {age.total_seconds():.2f} сек. "
+            f"Время сообщения: {message_date}. "
+            f"Время сервера: {current_date}."
+        )
+        await message.reply_text(
+            escape_markdown_v2(f"❌ Ошибка: Ваша геолокация слишком старая ({int(age.total_seconds())} сек.). Пожалуйста, отправьте текущую."),
+            reply_markup=ReplyKeyboardRemove(),
+            parse_mode=ParseMode.MARKDOWN_V2
+        )
+        return
+        
+    # --- КОНЕЦ ПРОВЕРОК ---
+
+    # =================================================================
+    # ▼▼▼ ВСЯ ТВОЯ СТАРАЯ БИЗНЕС-ЛОГИКА ОСТАЕТСЯ ЗДЕСЬ НИЖЕ ▼▼▼
+    # =================================================================
+    
     location = message.location
     latitude = location.latitude
     longitude = location.longitude
@@ -1354,8 +1381,8 @@ async def location_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     logger.info(f"Получена легитимная геолокация от {user.id} ({user.username}): Широта={latitude}, Долгота={longitude}")
 
     user_data_from_db = db.get_user(user.id)
-    is_admin_from_config = user.id in ADMIN_TELEGRAM_IDS
-    is_authorized_in_db = user_data_from_db and user_data_from_db['is_authorized']
+    is_admin_from_config = is_admin(user.id) 
+    is_authorized_in_db = user_data_from_db and user_data_from_db.get('is_authorized')
 
     if not (is_admin_from_config or is_authorized_in_db):
         error_message_unauth = escape_markdown_v2("❌ Ошибка: Вы не авторизованы. Отметка не будет сохранена.")
@@ -1369,7 +1396,8 @@ async def location_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     if is_admin_from_config and (not user_data_from_db or not is_authorized_in_db):
-        db.add_or_update_user(user.id, user.username, user.first_name, user.last_name)
+        # Убедись, что твоя функция add_or_update_user может принимать None для некоторых полей
+        db.add_or_update_user(user.id, user.username or "N/A", user.first_name or "N/A", user.last_name or "N/A", None, None)
         db.authorize_user(user.id, user.id)
         logger.info(f"Администратор {user.id} ({user.username}) автоматически добавлен/авторизован при отправке локации.")
 
@@ -1386,7 +1414,7 @@ async def location_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         logger.info(f"Пользователь {user.id} находится вне разрешенной геозоны. Check-in отклонен.")
         error_message_geofence = escape_markdown_v2(
             "❌ Вы находитесь слишком далеко от офиса для отметки прихода. "
-            "Пожалуйста, подойдите ближе и попробуйте снова, используя команду /checkin."
+            "Пожалуйста, подойдите ближе и попробуйте снова."
         )
         await message.reply_text(
             error_message_geofence, 
