@@ -11,11 +11,13 @@ from zoneinfo import ZoneInfo
 from typing import Union, Dict 
 import pytz
 import telegram
+from telegram import WebAppInfo
 from telegram.error import Forbidden
 from telegram import Update, KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove, BotCommand, BotCommandScopeChat, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.constants import ParseMode
 from telegram import Update, User, Bot
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler, ConversationHandler
+from services.attendance import checkin, checkout
 from openpyxl.styles import Font
 import config
 from config import TELEGRAM_BOT_TOKEN, ADMIN_TELEGRAM_IDS, THE_OFFICE_ZONE, ITEMS_PER_PAGE, SECTOR_WEEKLY_NORMS 
@@ -136,12 +138,15 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             # Дополнительно можно проверить user_data['is_admin'], если это поле используется и синхронизируется
             auth_status_text += " (Администратор)"
         
-        text_to_send = (
-            f"👋 С возвращением, {safe_first_name}\\!\n"
-            f"Ваш Telegram ID: `{user.id}`\n"
-            f"Статус: {escape_markdown_v2(auth_status_text)}\n\n"
-            "Используйте меню команд \\(кнопка `/` или три полоски\\) для взаимодействия с ботом\\."
-        )
+            link_code = user_data.get("link_code", "")
+            link_code_text = f"\nКод привязки VK: `{link_code}`" if link_code else ""
+            text_to_send = (
+                f"👋 С возвращением, {safe_first_name}\\!\n"
+                f"Ваш Telegram ID: `{user.id}`\n"
+                f"Статус: {escape_markdown_v2(auth_status_text)}"
+                f"{escape_markdown_v2(link_code_text)}\n\n"
+                "Используйте меню команд \\(кнопка `/` или три полоски\\) для взаимодействия с ботом\\."
+            )
         await update.message.reply_text(text_to_send, parse_mode=ParseMode.MARKDOWN_V2)
     elif user_data and user_data['application_status'] == 'pending':
         text_to_send = (
@@ -158,6 +163,52 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         keyboard = [[InlineKeyboardButton("Подать заявку на доступ", callback_data="apply_for_access")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await update.message.reply_text(text_to_send, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN_V2)
+
+AWAIT_VK_LINK_CODE = 90
+
+async def link_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user = update.effective_user
+    user_data = db.get_user(user.id)
+
+    if not user_data:
+        await update.message.reply_text(
+            escape_markdown_v2("❌ Вы не зарегистрированы. Напишите /start для начала."),
+            parse_mode=ParseMode.MARKDOWN_V2
+        )
+        return ConversationHandler.END
+
+    vk_status = escape_markdown_v2(
+        f"✅ Привязан (VK ID: {user_data['vk_id']})" if user_data.get("vk_id") 
+        else "❌ Не привязан"
+    )
+    link_code = user_data.get("link_code", "—")
+
+    text = (
+        f"🔗 *Привязка аккаунтов TG/VK*\n\n"
+        f"Статус VK: {vk_status}\n\n"
+        f"Ваш код Telegram: `{link_code}`\n"
+        f"Введите его в VK\\-боте кнопкой '🔗 Привязка аккаунтов'\n\n"
+        f"Или введите код из VK\\-бота сюда чтобы привязать VK:"
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN_V2)
+    return AWAIT_VK_LINK_CODE
+
+async def receive_vk_link_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user = update.effective_user
+    code = update.message.text.strip()
+    success, msg = db.merge_users_on_link(code, telegram_id=user.id)
+    await update.message.reply_text(
+        escape_markdown_v2(msg),
+        parse_mode=ParseMode.MARKDOWN_V2
+    )
+    return ConversationHandler.END
+
+async def cancel_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text(
+        escape_markdown_v2("Привязка отменена."),
+        parse_mode=ParseMode.MARKDOWN_V2
+    )
+    return ConversationHandler.END
 
 @admin_required
 async def on_shift_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1303,14 +1354,18 @@ async def checkin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
     if is_admin_from_config and (not user_data_from_db or not is_authorized_in_db):
         db.add_or_update_user(user.id, user.username, user.first_name, user.last_name)
-        db.authorize_user(user.id, user.id) # Админа авторизуем сразу
+        db.authorize_user(user.id, user.id)
         logger.info(f"Администратор {user.id} ({user.username}) автоматически добавлен/авторизован при попытке /checkin.")
-    
-    location_button = KeyboardButton(text="📍 Отправить мою геолокацию", request_location=True)
-    reply_markup = ReplyKeyboardMarkup([[location_button]], resize_keyboard=True, one_time_keyboard=True)
+
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            "📍 Отметить приход",
+            web_app=WebAppInfo(url=f"https://tabel-opk.ru/static/checkin.html?telegram_id={user.id}")
+        )
+    ]])
     await update.message.reply_text(
-        escape_markdown_v2("Для отметки о приходе, пожалуйста, поделитесь вашей текущей геолокацией."),
-        reply_markup=reply_markup,
+        escape_markdown_v2("Нажмите кнопку для отметки прихода:"),
+        reply_markup=keyboard,
         parse_mode=ParseMode.MARKDOWN_V2
     )
 
@@ -1328,7 +1383,7 @@ async def checkout_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         db.add_or_update_user(user.id, user.username, user.first_name, user.last_name)
         db.authorize_user(user.id, user.id)
         logger.info(f"Администратор {user.id} ({user.username}) автоматически добавлен/авторизован при попытке /checkout.")
-    success, message_from_db = db.record_check_out(user.id)
+    success, message_from_db = checkout(user.id)
     await update.message.reply_text(escape_markdown_v2(message_from_db), parse_mode=ParseMode.MARKDOWN_V2)
 
 async def location_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1401,8 +1456,6 @@ async def location_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         db.authorize_user(user.id, user.id)
         logger.info(f"Администратор {user.id} ({user.username}) автоматически добавлен/авторизован при отправке локации.")
 
-    if is_within_office_zone(latitude, longitude):
-        logger.info(f"Пользователь {user.id} находится в разрешенной геозоне. Попытка check-in.")
         success, message_from_db = db.record_check_in(user.id, latitude, longitude)
         
         await message.reply_text(
@@ -2870,7 +2923,7 @@ async def _send_pending_list_message(
 
     # Формируем кнопки для пользователей на текущей странице
     for i, user_row in enumerate(current_page_items):
-        user_id = user_row['telegram_id']
+        user_id = user_row['telegram_id'] or user_row.get('user_id')
         # Глобальный номер элемента в списке (для отображения)
         global_item_number = start_index + i + 1 
         app_full_name_raw = user_row['application_full_name'] if user_row['application_full_name'] else "ФИО не указано"
@@ -3031,7 +3084,7 @@ async def admin_action_callback_handler(update: Update, context: ContextTypes.DE
 
     elif action == "view_user_app":
         logger.info(f"АДМИН ДЕЙСТВИЕ: Администратор {admin_user.id} просматривает заявку пользователя {target_user_id}.")
-        user_data = db.get_user(target_user_id)
+        user_data = db.get_user(target_user_id) or db.get_user_by_user_id(target_user_id)
 
         if not user_data:
             error_msg = escape_markdown_v2(f"Не удалось найти данные для пользователя ID {target_user_id}.")
@@ -3095,7 +3148,14 @@ async def admin_action_callback_handler(update: Update, context: ContextTypes.DE
 
     elif action == "card_auth_app":
         logger.info(f"АДМИН ДЕЙСТВИЕ: Администратор {admin_user.id} нажал 'Авторизовать' с карточки для {target_user_id}.")
-        success, message_from_db = db.authorize_user(target_user_id, admin_user.id)
+        user_check = db.get_user(target_user_id) or db.get_user_by_user_id(target_user_id)
+        if user_check and user_check.get('telegram_id'):
+            success, message_from_db = db.authorize_user(user_check['telegram_id'], admin_user.id)
+        else:
+            # VK-пользователь без telegram_id — авторизуем через user_id
+            admin = db.get_user_by_telegram_id(admin_user.id)
+            admin_uid = admin["user_id"] if admin else admin_user.id
+            success, message_from_db = db.authorize_user_by_vk(user_check['vk_id'], admin_uid)
         
         feedback_to_admin = message_from_db
         if success and "успешно авторизован" in message_from_db:
@@ -3149,7 +3209,14 @@ async def admin_action_callback_handler(update: Update, context: ContextTypes.DE
 
     elif action == "card_reject_app":
         logger.info(f"АДМИН ДЕЙСТВИЕ: Администратор {admin_user.id} нажал 'Отклонить' с карточки для {target_user_id}.")
-        success, message_from_db = db.reject_application(target_user_id, admin_user.id, reason=None) 
+        user_check = db.get_user(target_user_id) or db.get_user_by_user_id(target_user_id) 
+        if user_check and user_check.get('telegram_id'):
+            success, message_from_db = db.authorize_user(user_check['telegram_id'], admin_user.id)
+        else:
+            # VK-пользователь без telegram_id — авторизуем через user_id
+            admin = db.get_user_by_telegram_id(admin_user.id)
+            admin_uid = admin["user_id"] if admin else admin_user.id
+            success, message_from_db = db.authorize_user_by_vk(user_check['vk_id'], admin_uid)
         
         feedback_to_admin = message_from_db 
         if success and "успешно отклонена" in message_from_db:
@@ -3244,6 +3311,12 @@ async def set_bot_commands(application: Application):
         BotCommand("admin_export_attendance", "📊 Экспорт отчета о посещаемости"),
         BotCommand("admin_manual_checkins", "🛠️ Ручные заявки на приход"),
         BotCommand("restart", "🔄 Сброс диалога(если бот завис)"),
+    ]
+    authorized_user_commands = [
+        BotCommand("checkin", "✅ Отметить приход на работу"),
+        BotCommand("checkout", "👋 Отметить уход с работы"),
+        BotCommand("request_manual_checkin", "🛠️ Запросить ручной приход"),
+        BotCommand("link", "🔗 Код привязки VK-аккаунта"),  # ← добавить
     ]
 
     # Эта строка объединяет common_commands и (теперь обновленные) authorized_user_commands.
@@ -3414,6 +3487,23 @@ def main() -> None:
         conversation_timeout=3600,
         allow_reentry=True
     )
+    
+    AWAIT_VK_LINK_CODE = 90
+
+    link_conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("link", link_command)],
+        states={
+            AWAIT_VK_LINK_CODE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_vk_link_code)
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_link)],
+        name="link_flow",
+        per_user=True,
+        per_chat=True,
+        allow_reentry=True
+    )
+    
 
     # --- РЕГИСТРАЦИЯ ВСЕХ ОБРАБОТЧИКОВ ---
     
@@ -3422,12 +3512,14 @@ def main() -> None:
     application.add_handler(manual_checkin_conv_handler)
     application.add_handler(admin_manual_checkins_conv_handler) 
     application.add_handler(edit_checkout_conv_handler)
+    application.add_handler(link_conv_handler)
 
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("checkin", checkin_command))
     application.add_handler(CommandHandler("checkout", checkout_command))
     application.add_handler(CommandHandler("restart", restart_command))
+
     
     # ИСПРАВЛЕНИЕ №3: ДОБАВЛЕН ФИЛЬТР ДЛЯ ПРОСТЫХ КОМАНД
     application.add_handler(CommandHandler("on_shift", on_shift_command, filters=AdminFilter()))

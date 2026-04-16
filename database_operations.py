@@ -1,15 +1,15 @@
 import sqlite3
+import secrets
+import string
 import logging
 from datetime import datetime, timedelta
 import pytz
-from pytz import utc
+
 from config import DATABASE_PATH
 
-
 logger = logging.getLogger(__name__)
+MOSCOW_TZ = pytz.timezone("Europe/Moscow")
 
-
-MOSCOW_TZ = pytz.timezone('Europe/Moscow')
 
 def get_db_connection():
     conn = sqlite3.connect(DATABASE_PATH)
@@ -17,91 +17,70 @@ def get_db_connection():
     return conn
 
 
-# В файле database_operations.py
 def init_db():
-    conn = None 
+    conn = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        
-        # --- Таблица users ---
-        cursor.execute('''
+
+        # --- users ---
+        # user_id — внутренний первичный ключ
+        # telegram_id / vk_id — внешние идентификаторы, оба опциональны
+        # link_code — постоянный код привязки аккаунтов
+        cursor.execute("""
             CREATE TABLE IF NOT EXISTS users (
-                telegram_id INTEGER PRIMARY KEY,
-                username TEXT,
-                first_name TEXT,
-                last_name TEXT,
-                application_full_name TEXT,
+                user_id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id         INTEGER UNIQUE,
+                vk_id               INTEGER UNIQUE,
+                link_code           TEXT UNIQUE,
+                username            TEXT,
+                first_name          TEXT,
+                last_name           TEXT,
+                application_full_name  TEXT,
                 application_department TEXT,
-                is_authorized BOOLEAN DEFAULT FALSE,
-                is_admin BOOLEAN DEFAULT FALSE,
-                registration_date DATETIME DEFAULT CURRENT_TIMESTAMP,
-                application_status TEXT DEFAULT 'none' 
+                is_authorized       BOOLEAN DEFAULT FALSE,
+                is_admin            BOOLEAN DEFAULT FALSE,
+                registration_date   DATETIME DEFAULT CURRENT_TIMESTAMP,
+                application_status  TEXT DEFAULT 'none'
             )
-        ''')
+        """)
         logger.info("Таблица 'users' проверена/создана.")
 
-        # --- Таблица work_sessions ---
-        cursor.execute('''
+        # --- work_sessions ---
+        # user_id — внутренний FK, не telegram_id
+        cursor.execute("""
             CREATE TABLE IF NOT EXISTS work_sessions (
-                session_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                telegram_id INTEGER NOT NULL,
-                check_in_time DATETIME NOT NULL, 
-                check_out_time DATETIME,          
+                session_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id         INTEGER NOT NULL,
+                check_in_time   DATETIME NOT NULL,
+                check_out_time  DATETIME,
                 duration_minutes INTEGER,
-                latitude REAL,
-                longitude REAL,
-                checkin_type TEXT NOT NULL DEFAULT 'geo',
-                sector_id TEXT,  -- <--- ВОТ ЭТА СТРОКА ДОБАВЛЕНА
-                FOREIGN KEY (telegram_id) REFERENCES users (telegram_id)
+                latitude        REAL,
+                longitude       REAL,
+                checkin_type    TEXT NOT NULL DEFAULT 'geo',
+                sector_id       TEXT,
+                FOREIGN KEY (user_id) REFERENCES users(user_id)
             )
-        ''')
+        """)
         logger.info("Таблица 'work_sessions' проверена/создана.")
 
-        # Проверка и добавление столбца checkin_type в work_sessions, если его нет (для существующих БД)
-        # ЭТОТ БЛОК МОЖНО ОСТАВИТЬ, ОН НЕ МЕШАЕТ
-        cursor.execute("PRAGMA table_info(work_sessions)")
-        columns = [column[1] for column in cursor.fetchall()]
-        if 'checkin_type' not in columns: # Он уже должен быть из CREATE TABLE выше, но проверка не повредит
-            try: # Добавим try-except на случай, если столбец уже есть из-за предыдущих попыток
-                cursor.execute("ALTER TABLE work_sessions ADD COLUMN checkin_type TEXT NOT NULL DEFAULT 'geo'")
-                logger.info("Столбец 'checkin_type' добавлен в таблицу 'work_sessions' через ALTER.")
-            except sqlite3.OperationalError as alter_e:
-                if "duplicate column name" in str(alter_e).lower():
-                    logger.info("Столбец 'checkin_type' уже существует в 'work_sessions'.")
-                else:
-                    raise # Перевыбрасываем, если это другая ошибка ALTER
-        
-        # Проверка и добавление столбца sector_id в work_sessions, если его нет (для существующих БД)
-        # Это полезно, если вы не хотите удалять БД при каждом изменении схемы
-        cursor.execute("PRAGMA table_info(work_sessions)") # Получаем свежую информацию о столбцах
-        columns = [column[1] for column in cursor.fetchall()]
-        if 'sector_id' not in columns:
-            try:
-                cursor.execute("ALTER TABLE work_sessions ADD COLUMN sector_id TEXT")
-                logger.info("Столбец 'sector_id' добавлен в таблицу 'work_sessions' через ALTER.")
-            except sqlite3.OperationalError as alter_e_sector:
-                if "duplicate column name" in str(alter_e_sector).lower():
-                    logger.info("Столбец 'sector_id' уже существует в 'work_sessions'.")
-                else:
-                    raise 
-        
-        cursor.execute('''
+        # --- manual_checkin_requests ---
+        cursor.execute("""
             CREATE TABLE IF NOT EXISTS manual_checkin_requests (
-                request_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                requested_checkin_time TEXT NOT NULL, 
-                request_timestamp TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, 
-                status TEXT NOT NULL DEFAULT 'pending', 
-                admin_id_processed INTEGER,
-                processed_timestamp TEXT,
-                final_checkin_time TEXT, 
-                FOREIGN KEY (user_id) REFERENCES users(telegram_id),
-                FOREIGN KEY (admin_id_processed) REFERENCES users(telegram_id)
+                request_id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id                 INTEGER NOT NULL,
+                requested_checkin_time  TEXT NOT NULL,
+                request_timestamp       TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                status                  TEXT NOT NULL DEFAULT 'pending',
+                admin_user_id           INTEGER,
+                processed_timestamp     TEXT,
+                final_checkin_time      TEXT,
+                FOREIGN KEY (user_id)       REFERENCES users(user_id),
+                FOREIGN KEY (admin_user_id) REFERENCES users(user_id)
             )
-        ''')
+        """)
         logger.info("Таблица 'manual_checkin_requests' проверена/создана.")
-        
+
         conn.commit()
     except sqlite3.Error as e:
         logger.error(f"Ошибка при инициализации БД: {e}", exc_info=True)
@@ -110,841 +89,895 @@ def init_db():
             conn.close()
 
 
-def add_or_update_user(telegram_id: int, username: str = None, first_name: str = None, last_name: str = None):
-    conn = get_db_connection()
-    try:
-        cursor = conn.cursor()
-        
-        registration_time_msk = datetime.now(MOSCOW_TZ)
+# ------------------------------------------------------------------ #
+# Генерация кода привязки                                             #
+# ------------------------------------------------------------------ #
 
-        cursor.execute('''
-            INSERT INTO users (telegram_id, username, first_name, last_name, registration_date)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(telegram_id) DO UPDATE SET
-                username = COALESCE(excluded.username, users.username),
-                first_name = COALESCE(excluded.first_name, users.first_name),
-                last_name = COALESCE(excluded.last_name, users.last_name)
-        ''', (telegram_id, username, first_name, last_name, registration_time_msk))
-        conn.commit()
-        logger.info(f"Пользователь {telegram_id} ({first_name}) добавлен/обновлен в БД.")
-        return True
-    except sqlite3.Error as e:
-        logger.error(f"Ошибка при добавлении/обновлении пользователя {telegram_id}: {e}")
-        return False
-    finally:
-        if conn:
+def _generate_link_code() -> str:
+    """Генерирует уникальный 6-символьный код привязки."""
+    alphabet = string.ascii_uppercase + string.digits
+    while True:
+        code = "".join(secrets.choice(alphabet) for _ in range(6))
+        conn = get_db_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SELECT 1 FROM users WHERE link_code = ?", (code,))
+            if not cursor.fetchone():
+                return code
+        finally:
             conn.close()
 
 
-def get_user(telegram_id: int):
-    """
-    Получает пользователя по ID и возвращает его данные в виде СЛОВАРЯ.
-    """
+# ------------------------------------------------------------------ #
+# Поиск пользователя (внутренний хелпер)                              #
+# ------------------------------------------------------------------ #
+
+def _get_user_by_field(field: str, value) -> dict | None:
     conn = get_db_connection()
     try:
         cursor = conn.cursor()
-        cursor.execute("SELECT * FROM users WHERE telegram_id = ?", (telegram_id,))
-        user_row = cursor.fetchone()
-        
-        # --- ВОТ ОНО, ГЛАВНОЕ ИСПРАВЛЕНИЕ ---
-        # Если пользователь найден (user_row не None),
-        # конвертируем специальный объект sqlite3.Row в обычный словарь.
-        if user_row:
-            return dict(user_row)
-        return None # Если пользователь не найден, возвращаем None
-        # ------------------------------------
-
-
+        cursor.execute(f"SELECT * FROM users WHERE {field} = ?", (value,))
+        row = cursor.fetchone()
+        return dict(row) if row else None
     except sqlite3.Error as e:
-        logger.error(f"Ошибка при получении пользователя {telegram_id}: {e}")
+        logger.error(f"Ошибка при поиске пользователя по {field}={value}: {e}")
         return None
     finally:
+        conn.close()
+
+
+# ------------------------------------------------------------------ #
+# Публичные функции поиска пользователя                               #
+# ------------------------------------------------------------------ #
+
+def get_user_by_telegram_id(telegram_id: int) -> dict | None:
+    return _get_user_by_field("telegram_id", telegram_id)
+
+
+def get_user_by_vk_id(vk_id: int) -> dict | None:
+    return _get_user_by_field("vk_id", vk_id)
+
+
+def get_user_by_user_id(user_id: int) -> dict | None:
+    return _get_user_by_field("user_id", user_id)
+
+
+def get_user_by_link_code(link_code: str) -> dict | None:
+    return _get_user_by_field("link_code", link_code.upper().strip())
+
+
+# Обратная совместимость — используется в bot_main.py
+def get_user(telegram_id: int) -> dict | None:
+    return get_user_by_telegram_id(telegram_id)
+
+
+# ------------------------------------------------------------------ #
+# Регистрация / обновление                                            #
+# ------------------------------------------------------------------ #
+
+def add_or_update_user(
+    telegram_id: int = None,
+    username: str = None,
+    first_name: str = None,
+    last_name: str = None,
+    vk_id: int = None,
+) -> dict | None:
+    """
+    Добавляет нового пользователя или обновляет существующего.
+    При создании автоматически генерирует link_code.
+    Возвращает словарь с данными пользователя.
+    """
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        reg_time = datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+        # Ищем существующего пользователя
+        existing = None
+        if telegram_id:
+            existing = get_user_by_telegram_id(telegram_id)
+        if not existing and vk_id:
+            existing = get_user_by_vk_id(vk_id)
+
+        if existing:
+            # Обновляем данные
+            cursor.execute("""
+                UPDATE users SET
+                    username   = COALESCE(?, username),
+                    first_name = COALESCE(?, first_name),
+                    last_name  = COALESCE(?, last_name),
+                    telegram_id = COALESCE(?, telegram_id),
+                    vk_id       = COALESCE(?, vk_id)
+                WHERE user_id = ?
+            """, (username, first_name, last_name, telegram_id, vk_id, existing["user_id"]))
+            conn.commit()
+            logger.info(f"Пользователь user_id={existing['user_id']} обновлён.")
+            return get_user_by_user_id(existing["user_id"])
+        else:
+            # Создаём нового
+            link_code = _generate_link_code()
+            cursor.execute("""
+                INSERT INTO users
+                    (telegram_id, vk_id, link_code, username, first_name, last_name, registration_date)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (telegram_id, vk_id, link_code, username, first_name, last_name, reg_time))
+            conn.commit()
+            user_id = cursor.lastrowid
+            logger.info(f"Новый пользователь создан: user_id={user_id}, link_code={link_code}.")
+            return get_user_by_user_id(user_id)
+
+    except sqlite3.Error as e:
+        logger.error(f"Ошибка при добавлении/обновлении пользователя: {e}", exc_info=True)
+        return None
+    finally:
+        conn.close()
+
+
+# ------------------------------------------------------------------ #
+# Привязка аккаунтов по коду                                          #
+# ------------------------------------------------------------------ #
+
+def link_account_by_code(code: str, vk_id: int = None, telegram_id: int = None) -> tuple[bool, str]:
+    """
+    Привязывает VK или Telegram аккаунт к существующему пользователю по коду.
+
+    Сценарий: пользователь зарегистрирован в TG, хочет привязать VK.
+    Вводит код в VK → вызываем link_account_by_code(code, vk_id=12345)
+    """
+    if not vk_id and not telegram_id:
+        return False, "Не указан ни VK ID, ни Telegram ID для привязки."
+
+    target = get_user_by_link_code(code)
+    if not target:
+        return False, "❌ Код не найден. Проверьте правильность ввода."
+
+    # Проверяем что этот аккаунт ещё не привязан
+    if vk_id and target.get("vk_id"):
+        return False, "❌ К этому аккаунту уже привязан VK."
+    if telegram_id and target.get("telegram_id"):
+        return False, "❌ К этому аккаунту уже привязан Telegram."
+
+    # Проверяем что vk_id/telegram_id не принадлежат другому пользователю
+    if vk_id:
+        existing_vk = get_user_by_vk_id(vk_id)
+        if existing_vk and existing_vk["user_id"] != target["user_id"]:
+            return False, "❌ Этот VK аккаунт уже зарегистрирован в системе."
+    if telegram_id:
+        existing_tg = get_user_by_telegram_id(telegram_id)
+        if existing_tg and existing_tg["user_id"] != target["user_id"]:
+            return False, "❌ Этот Telegram аккаунт уже зарегистрирован в системе."
+
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        if vk_id:
+            cursor.execute("UPDATE users SET vk_id = ? WHERE user_id = ?", (vk_id, target["user_id"]))
+        if telegram_id:
+            cursor.execute("UPDATE users SET telegram_id = ? WHERE user_id = ?", (telegram_id, target["user_id"]))
+        conn.commit()
+        name = target.get("application_full_name") or target.get("first_name") or str(target["user_id"])
+        logger.info(f"Аккаунт привязан: user_id={target['user_id']}, vk_id={vk_id}, telegram_id={telegram_id}.")
+        return True, f"✅ Аккаунт успешно привязан! Добро пожаловать, {name}."
+    except sqlite3.Error as e:
+        logger.error(f"Ошибка при привязке аккаунта: {e}", exc_info=True)
+        return False, "❌ Ошибка базы данных при привязке аккаунта."
+    finally:
+        conn.close()
+
+def merge_users_on_link(code: str, vk_id: int = None, telegram_id: int = None) -> tuple[bool, str]:
+    """
+    Привязывает аккаунты с мержем если оба уже существуют в БД.
+    """
+    if not vk_id and not telegram_id:
+        return False, "Не указан ни VK ID, ни Telegram ID для привязки."
+
+    target = get_user_by_link_code(code)
+    if not target:
+        return False, "❌ Код не найден. Проверьте правильность ввода."
+
+    if vk_id and target.get("vk_id"):
+        return False, "❌ К этому аккаунту уже привязан VK."
+    if telegram_id and target.get("telegram_id"):
+        return False, "❌ К этому аккаунту уже привязан Telegram."
+
+    existing = None
+    if vk_id:
+        existing = get_user_by_vk_id(vk_id)
+    if telegram_id:
+        existing = get_user_by_telegram_id(telegram_id)
+
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        if existing and existing["user_id"] != target["user_id"]:
+            existing_uid = existing["user_id"]
+            target_uid   = target["user_id"]
+
+            cursor.execute(
+                "UPDATE work_sessions SET user_id=? WHERE user_id=?",
+                (target_uid, existing_uid)
+            )
+            cursor.execute(
+                "UPDATE manual_checkin_requests SET user_id=? WHERE user_id=?",
+                (target_uid, existing_uid)
+            )
+            if not target.get("application_full_name") and existing.get("application_full_name"):
+                cursor.execute("""
+                    UPDATE users SET
+                        application_full_name = ?,
+                        application_department = ?,
+                        application_status = ?,
+                        is_authorized = ?
+                    WHERE user_id = ?
+                """, (
+                    existing["application_full_name"],
+                    existing["application_department"],
+                    existing["application_status"],
+                    existing["is_authorized"],
+                    target_uid
+                ))
+            cursor.execute("DELETE FROM users WHERE user_id=?", (existing_uid,))
+            logger.info(f"Мерж: user_id={existing_uid} → user_id={target_uid}")
+
+        if vk_id:
+            cursor.execute("UPDATE users SET vk_id=? WHERE user_id=?", (vk_id, target["user_id"]))
+        if telegram_id:
+            cursor.execute("UPDATE users SET telegram_id=? WHERE user_id=?", (telegram_id, target["user_id"]))
+
+        conn.commit()
+        name = target.get("application_full_name") or target.get("first_name") or str(target["user_id"])
+        return True, f"✅ Аккаунты успешно привязаны! Добро пожаловать, {name}."
+
+    except sqlite3.Error as e:
+        if conn:
+            conn.rollback()
+        logger.error(f"Ошибка при мерже пользователей: {e}", exc_info=True)
+        return False, "❌ Ошибка базы данных при привязке аккаунта."
+    finally:
         if conn:
             conn.close()
+
+
+# ------------------------------------------------------------------ #
+# Авторизация                                                         #
+# ------------------------------------------------------------------ #
 
 def is_user_authorized(telegram_id: int) -> bool:
-    """
-    Проверяет, авторизован ли пользователь.
-    :param telegram_id: Telegram ID пользователя.
-    :return: True, если пользователь существует и авторизован, иначе False.
-    """
-    user_data = get_user(telegram_id) 
-    if user_data and user_data['is_authorized']: # is_authorized BOOLEAN (0 или 1)
-        return True
-    return False
+    user = get_user_by_telegram_id(telegram_id)
+    return bool(user and user.get("is_authorized"))
 
-def authorize_user(telegram_id_to_authorize: int, authorizing_admin_id: int):
-    conn = get_db_connection()
-    try:
-        cursor = conn.cursor()
-        user_exists = get_user(telegram_id_to_authorize)
-        if not user_exists:
-            logger.warning(f"Попытка авторизации несуществующего пользователя {telegram_id_to_authorize} администратором {authorizing_admin_id}.")
-            return False, f"Пользователь с ID {telegram_id_to_authorize} не найден в базе."
-        cursor.execute('''
-            UPDATE users SET is_authorized = TRUE, application_status = 'approved'
-            WHERE telegram_id = ?
-        ''', (telegram_id_to_authorize,))
-        conn.commit()
-        if cursor.rowcount > 0:
-            logger.info(f"Пользователь {telegram_id_to_authorize} авторизован администратором {authorizing_admin_id} (статус 'approved').")
-            return True, f"Пользователь ID {telegram_id_to_authorize} успешно авторизован."
-        else:
-            if user_exists['is_authorized'] and user_exists['application_status'] == 'approved':
-                 return True, f"Пользователь ID {telegram_id_to_authorize} уже был авторизован ранее."
-            logger.warning(f"Не удалось авторизовать пользователя {telegram_id_to_authorize} (rowcount=0, не был уже авторизован или статус не 'approved').")
-            return False, f"Не удалось авторизовать пользователя ID {telegram_id_to_authorize}."
-    except sqlite3.Error as e:
-        logger.error(f"Ошибка SQLite при авторизации пользователя {telegram_id_to_authorize}: {e}")
-        return False, f"Произошла ошибка базы данных при авторизации пользователя {telegram_id_to_authorize}."
-    finally:
-        if conn:
-            conn.close()
 
-def list_pending_users():
+def is_user_authorized_by_vk(vk_id: int) -> bool:
+    user = get_user_by_vk_id(vk_id)
+    return bool(user and user.get("is_authorized"))
+
+
+def authorize_user(telegram_id_to_authorize: int, authorizing_admin_id: int) -> tuple[bool, str]:
+    """Авторизует пользователя по его telegram_id. Обратная совместимость с bot_main.py."""
+    target = get_user_by_telegram_id(telegram_id_to_authorize)
+    if not target:
+        return False, f"Пользователь с Telegram ID {telegram_id_to_authorize} не найден."
+    return _authorize_by_user_id(target["user_id"], authorizing_admin_id)
+
+
+def authorize_user_by_vk(vk_id: int, admin_user_id: int) -> tuple[bool, str]:
+    """Авторизует пользователя по его vk_id."""
+    target = get_user_by_vk_id(vk_id)
+    if not target:
+        return False, f"Пользователь с VK ID {vk_id} не найден."
+    return _authorize_by_user_id(target["user_id"], admin_user_id)
+
+
+def _authorize_by_user_id(user_id: int, admin_user_id: int) -> tuple[bool, str]:
     conn = get_db_connection()
     try:
         cursor = conn.cursor()
         cursor.execute("""
-            SELECT telegram_id, username, first_name, last_name, registration_date, application_full_name, application_department 
-            FROM users 
-            WHERE application_status = 'pending' AND is_authorized = FALSE
-            ORDER BY registration_date ASC 
-        """)
-        users = cursor.fetchall()
-        return users
+            UPDATE users SET is_authorized = TRUE, application_status = 'approved'
+            WHERE user_id = ?
+        """, (user_id,))
+        conn.commit()
+        if cursor.rowcount > 0:
+            logger.info(f"user_id={user_id} авторизован администратором user_id={admin_user_id}.")
+            return True, f"Пользователь ID {user_id} успешно авторизован."
+        return False, f"Не удалось авторизовать пользователя ID {user_id}."
     except sqlite3.Error as e:
-        logger.error(f"Ошибка при получении списка ожидающих пользователей: {e}")
+        logger.error(f"Ошибка при авторизации user_id={user_id}: {e}", exc_info=True)
+        return False, "Ошибка базы данных при авторизации."
+    finally:
+        conn.close()
+
+
+# ------------------------------------------------------------------ #
+# Заявки на доступ                                                    #
+# ------------------------------------------------------------------ #
+
+def submit_application(telegram_id: int, full_name: str, department: str) -> tuple[bool, str]:
+    user = get_user_by_telegram_id(telegram_id)
+    if not user:
+        return False, "Произошла ошибка. Пожалуйста, попробуйте сначала /start."
+    return _submit_application_by_user_id(user["user_id"], full_name, department)
+
+
+def submit_application_vk(vk_id: int, full_name: str, department: str) -> tuple[bool, str]:
+    user = get_user_by_vk_id(vk_id)
+    if not user:
+        return False, "Произошла ошибка. Пожалуйста, попробуйте сначала /start."
+    return _submit_application_by_user_id(user["user_id"], full_name, department)
+
+
+def _submit_application_by_user_id(user_id: int, full_name: str, department: str) -> tuple[bool, str]:
+    user = get_user_by_user_id(user_id)
+    if user["application_status"] == "pending":
+        return False, "Вы уже подали заявку. Ожидайте подтверждения администратором."
+    if user["application_status"] == "approved" or user["is_authorized"]:
+        return False, "Ваша заявка уже одобрена, и вы авторизованы."
+
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE users SET application_status = 'pending',
+                application_full_name = ?, application_department = ?
+            WHERE user_id = ?
+        """, (full_name, department, user_id))
+        conn.commit()
+        if cursor.rowcount > 0:
+            logger.info(f"user_id={user_id} подал заявку: {full_name}, {department}.")
+            return True, "✅ Ваша заявка на доступ успешно подана! Администратор рассмотрит ее в ближайшее время."
+        return False, "Не удалось подать заявку. Попробуйте ещё раз."
+    except sqlite3.Error as e:
+        logger.error(f"Ошибка при подаче заявки user_id={user_id}: {e}", exc_info=True)
+        return False, "Ошибка базы данных при подаче заявки."
+    finally:
+        conn.close()
+
+
+def list_pending_users() -> list:
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT user_id, telegram_id, vk_id, link_code, username, first_name, last_name,
+                   registration_date, application_full_name, application_department
+            FROM users
+            WHERE application_status = 'pending' AND is_authorized = FALSE
+            ORDER BY registration_date ASC
+        """)
+        return [dict(row) for row in cursor.fetchall()]
+    except sqlite3.Error as e:
+        logger.error(f"Ошибка при получении ожидающих пользователей: {e}", exc_info=True)
         return []
     finally:
-        if conn:
-            conn.close()
+        conn.close()
 
-def submit_application(telegram_id: int, full_name: str, department: str):
+
+def reject_application(telegram_id_to_reject: int, rejecting_admin_id: int, reason: str = None) -> tuple[bool, str]:
+    user = get_user_by_telegram_id(telegram_id_to_reject)
+    if not user:
+        return False, f"Пользователь с ID {telegram_id_to_reject} не найден."
+    if user["is_authorized"]:
+        return False, f"Пользователь уже авторизован."
     conn = get_db_connection()
     try:
         cursor = conn.cursor()
-        user = get_user(telegram_id)
-        if not user:
-            logger.error(f"Попытка подать заявку от незарегистрированного пользователя {telegram_id}")
-            return False, "Произошла ошибка. Пожалуйста, попробуйте сначала /start."
-        if user['application_status'] == 'pending':
-            return False, "Вы уже подали заявку. Ожидайте подтверждения администратором."
-        if user['application_status'] == 'approved' or user['is_authorized']:
-            return False, "Ваша заявка уже одобрена, и вы авторизованы."
-        cursor.execute('''
-            UPDATE users 
-            SET application_status = 'pending', 
-                application_full_name = ?, 
-                application_department = ?
-            WHERE telegram_id = ?
-        ''', (full_name, department, telegram_id))
+        cursor.execute("""
+            UPDATE users SET application_status = 'rejected', is_authorized = FALSE,
+                application_full_name = NULL, application_department = NULL
+            WHERE user_id = ? AND application_status = 'pending'
+        """, (user["user_id"],))
         conn.commit()
         if cursor.rowcount > 0:
-            logger.info(f"Пользователь {telegram_id} подал заявку на доступ (статус 'pending') с ФИО: {full_name}, Отдел: {department}.")
-            return True, "✅ Ваша заявка на доступ успешно подана! Администратор рассмотрит ее в ближайшее время."
-        else:
-            logger.warning(f"Не удалось обновить статус заявки для {telegram_id} (rowcount=0).")
-            return False, "Не удалось подать заявку. Попробуйте еще раз."
+            return True, f"Заявка пользователя ID {telegram_id_to_reject} успешно отклонена."
+        return False, "Не удалось отклонить заявку."
     except sqlite3.Error as e:
-        logger.error(f"Ошибка SQLite при подаче заявки пользователем {telegram_id}: {e}")
-        return False, "Произошла ошибка базы данных при подаче заявки."
+        logger.error(f"Ошибка при отклонении заявки: {e}", exc_info=True)
+        return False, "Ошибка базы данных."
     finally:
-        if conn:
-            conn.close()
+        conn.close()
 
-def record_check_in(user_id: int, latitude: float, longitude: float) -> tuple[bool, str]:
+
+# ------------------------------------------------------------------ #
+# Check-in / Check-out                                                #
+# ------------------------------------------------------------------ #
+
+def _get_internal_user_id(telegram_id: int = None, vk_id: int = None) -> int | None:
+    """Возвращает внутренний user_id по telegram_id или vk_id."""
+    if telegram_id:
+        user = get_user_by_telegram_id(telegram_id)
+    elif vk_id:
+        user = get_user_by_vk_id(vk_id)
+    else:
+        return None
+    return user["user_id"] if user else None
+
+
+def record_check_in(
+    user_id: int,
+    latitude: float,
+    longitude: float,
+    vk_id: int = None,
+) -> tuple[bool, str]:
     """
-    Записывает время прихода по геолокации.
-    1. Проверяет, что нет других активных сессий.
-    2. ТЕПЕРЬ ВСЕГДА ИСПОЛЬЗУЕТ И ЗАПИСЫВАЕТ МОСКОВСКОЕ ВРЕМЯ.
-    3. Находит и записывает департамент пользователя (sector_id).
+    Записывает check-in. user_id может быть telegram_id или vk_id.
+    Если передан vk_id=True — ищем по VK.
     """
+    internal_id = _get_internal_user_id(
+        telegram_id=None if vk_id else user_id,
+        vk_id=vk_id or (user_id if vk_id is not None else None),
+    ) if vk_id else _get_internal_user_id(telegram_id=user_id)
+
+    if not internal_id:
+        return False, "❌ Пользователь не найден в базе данных."
+
     conn = None
     try:
         conn = get_db_connection()
-        conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
 
+        cursor.execute(
+            "SELECT session_id FROM work_sessions WHERE user_id = ? AND check_out_time IS NULL",
+            (internal_id,)
+        )
+        if cursor.fetchone():
+            return False, "❌ Вы уже отметились на приходе. Сначала нужно отметить уход."
 
-        # Шаг 1: Проверка на активную сессию (без изменений)
-        cursor.execute("SELECT session_id FROM work_sessions WHERE telegram_id = ? AND check_out_time IS NULL", (user_id,))
-        existing_session = cursor.fetchone()
-        if existing_session:
-            logger.warning(f"DB: Пользователь {user_id} попытался отметиться на приходе, уже имея активную сессию.")
-            return (False, "❌ Вы уже отметились на приходе. Сначала нужно отметить уход.")
+        cursor.execute(
+            "SELECT application_department FROM users WHERE user_id = ?", (internal_id,)
+        )
+        row = cursor.fetchone()
+        department = row["application_department"] if row else None
 
+        now_msk = datetime.now(MOSCOW_TZ)
+        checkin_str = now_msk.strftime("%Y-%m-%d %H:%M:%S")
 
-        # Шаг 2: Получение департамента (без изменений)
-        cursor.execute("SELECT application_department FROM users WHERE telegram_id = ?", (user_id,))
-        user_record = cursor.fetchone()
-        user_department = user_record['application_department'] if user_record else None
-
-
-        # --- НАЧАЛО ГЛАВНОГО ИСПРАВЛЕНИЯ: ВОЗВРАЩАЕМСЯ К ПРОСТОМУ MSK ---
-        # Шаг 3: Получаем текущее МОСКОВСКОЕ время
-        moscow_time_now = datetime.now(MOSCOW_TZ)
-        
-        # Шаг 4: Превращаем его в строку для записи в базу
-        checkin_time_str_for_db = moscow_time_now.strftime('%Y-%m-%d %H:%M:%S')
-        # --- КОНЕЦ ГЛАВНОГО ИСПРАВЛЕНИЯ ---
-
-
-        # Шаг 5: Записываем все данные, ИСПОЛЬЗУЯ СТРОКУ МОСКОВСКОГО ВРЕМЕНИ
         cursor.execute("""
-            INSERT INTO work_sessions (telegram_id, check_in_time, checkin_type, latitude, longitude, sector_id)
+            INSERT INTO work_sessions (user_id, check_in_time, checkin_type, latitude, longitude, sector_id)
             VALUES (?, ?, 'geo', ?, ?, ?)
-        """, (user_id, checkin_time_str_for_db, latitude, longitude, user_department))
-        
+        """, (internal_id, checkin_str, latitude, longitude, department))
         conn.commit()
-        
-        # В сообщении пользователю показываем МОСКОВСКОЕ время, которое он и ожидает увидеть
-        time_str_for_message = moscow_time_now.strftime('%H:%M:%S')
-        logger.info(f"DB: Пользователь {user_id} успешно отметил приход по гео в {time_str_for_message} (МСК) в департаменте '{user_department}'.")
-        return (True, f"✅ Вы успешно отметили приход в {time_str_for_message}!")
 
+        time_str = now_msk.strftime("%H:%M:%S")
+        logger.info(f"Check-in: user_id={internal_id}, время={checkin_str}, сектор={department}.")
+        return True, f"✅ Вы успешно отметили приход в {time_str}!"
 
     except sqlite3.Error as e:
         if conn:
             conn.rollback()
-        logger.error(f"DB_ERROR: Ошибка при записи прихода для {user_id}: {e}", exc_info=True)
-        return (False, "❌ Произошла ошибка базы данных при попытке отметить приход.")
+        logger.error(f"Ошибка check-in для user_id={internal_id}: {e}", exc_info=True)
+        return False, "❌ Ошибка базы данных при отметке прихода."
     finally:
         if conn:
             conn.close()
+
+
+def record_check_in_vk(vk_id: int, latitude: float, longitude: float) -> tuple[bool, str]:
+    """Check-in через VK."""
+    internal_id = _get_internal_user_id(vk_id=vk_id)
+    if not internal_id:
+        return False, "❌ Пользователь не найден в базе данных."
+    return _record_check_in_internal(internal_id, latitude, longitude)
+
+
+def _record_check_in_internal(internal_id: int, latitude: float, longitude: float) -> tuple[bool, str]:
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        cursor.execute(
+            "SELECT session_id FROM work_sessions WHERE user_id = ? AND check_out_time IS NULL",
+            (internal_id,)
+        )
+        if cursor.fetchone():
+            return False, "❌ Вы уже отметились на приходе. Сначала нужно отметить уход."
+
+        cursor.execute("SELECT application_department FROM users WHERE user_id = ?", (internal_id,))
+        row = cursor.fetchone()
+        department = row["application_department"] if row else None
+
+        now_msk = datetime.now(MOSCOW_TZ)
+        checkin_str = now_msk.strftime("%Y-%m-%d %H:%M:%S")
+
+        cursor.execute("""
+            INSERT INTO work_sessions (user_id, check_in_time, checkin_type, latitude, longitude, sector_id)
+            VALUES (?, ?, 'geo', ?, ?, ?)
+        """, (internal_id, checkin_str, latitude, longitude, department))
+        conn.commit()
+
+        time_str = now_msk.strftime("%H:%M:%S")
+        logger.info(f"Check-in: user_id={internal_id}, время={checkin_str}.")
+        return True, f"✅ Вы успешно отметили приход в {time_str}!"
+
+    except sqlite3.Error as e:
+        if conn:
+            conn.rollback()
+        logger.error(f"Ошибка check-in user_id={internal_id}: {e}", exc_info=True)
+        return False, "❌ Ошибка базы данных при отметке прихода."
+    finally:
+        if conn:
+            conn.close()
+
 
 def record_check_out(user_id: int) -> tuple[bool, str]:
-    """
-    Записывает время ухода, ВЫЧИСЛЯЕТ ДЛИТЕЛЬНОСТЬ СЕССИИ,
-    и теперь работает ТОЛЬКО С МОСКОВСКИМ ВРЕМЕНЕМ из базы.
-    """
+    """Check-out по telegram_id (обратная совместимость)."""
+    internal_id = _get_internal_user_id(telegram_id=user_id)
+    if not internal_id:
+        return False, "❌ Пользователь не найден."
+    return _record_check_out_internal(internal_id)
+
+
+def record_check_out_vk(vk_id: int) -> tuple[bool, str]:
+    """Check-out по vk_id."""
+    internal_id = _get_internal_user_id(vk_id=vk_id)
+    if not internal_id:
+        return False, "❌ Пользователь не найден."
+    return _record_check_out_internal(internal_id)
+
+
+def _record_check_out_internal(internal_id: int) -> tuple[bool, str]:
     conn = None
     try:
         conn = get_db_connection()
-        # Используем conn.row_factory в get_db_connection, здесь не нужно
         cursor = conn.cursor()
 
-
-        # ШАГ 1: Находим ID сессии И ВРЕМЯ ПРИХОДА (которое теперь в МСК)
         cursor.execute("""
             SELECT session_id, check_in_time FROM work_sessions
-            WHERE telegram_id = ? AND check_out_time IS NULL
-            ORDER BY check_in_time DESC
-            LIMIT 1
-        """, (user_id,))
-        
-        # Используем dict(fetchone()) для удобства
+            WHERE user_id = ? AND check_out_time IS NULL
+            ORDER BY check_in_time DESC LIMIT 1
+        """, (internal_id,))
         row = cursor.fetchone()
         if not row:
-            logger.warning(f"DB: Пользователь {user_id} попытался уйти, не имея активных сессий.")
-            return (False, "❌ Вы не были отмечены на приходе. Невозможно отметить уход.")
-        
-        last_session = dict(row)
-        session_to_close_id = last_session['session_id']
-        check_in_time_msk_str = last_session['check_in_time']
-        
-        # --- НАЧАЛО ГЛАВНОГО ИСПРАВЛЕНИЯ: УПРОЩАЕМ ЧТЕНИЕ ВРЕМЕНИ ---
-        # Шаг 2: Превращаем строку МСК из базы в объект времени МСК
-        # Мы больше не конвертируем из UTC, а просто парсим строку как есть
-        # и добавляем информацию о часовом поясе.
-        check_in_time_naive = datetime.strptime(check_in_time_msk_str, '%Y-%m-%d %H:%M:%S')
-        check_in_moscow_dt = MOSCOW_TZ.localize(check_in_time_naive)
-        # --- КОНЕЦ ГЛАВНОГО ИСПРАВЛЕНИЯ ---
-        
-        # Шаг 3: Получаем текущее время ухода в МОСКВЕ (без изменений)
-        checkout_moscow_dt = datetime.now(MOSCOW_TZ)
-        
-        # Шаг 4: ВЫЧИСЛЯЕМ ДЛИТЕЛЬНОСТЬ СЕССИИ (без изменений, теперь работает правильно)
-        duration = checkout_moscow_dt - check_in_moscow_dt
-        total_seconds = int(duration.total_seconds())
-        hours, remainder = divmod(total_seconds, 3600)
-        minutes, _ = divmod(remainder, 60) # секунды в длительности не так важны
-        duration_str = f"{hours} ч {minutes:02} мин"
-        
-        # Шаг 5: Обновляем сессию в базе (без изменений)
-        checkout_time_str_for_db = checkout_moscow_dt.strftime('%Y-%m-%d %H:%M:%S')
+            return False, "❌ Вы не были отмечены на приходе. Невозможно отметить уход."
+
+        session_id = row["session_id"]
+        check_in_naive = datetime.strptime(row["check_in_time"], "%Y-%m-%d %H:%M:%S")
+        check_in_msk = MOSCOW_TZ.localize(check_in_naive)
+
+        now_msk = datetime.now(MOSCOW_TZ)
+        duration = now_msk - check_in_msk
+        total_sec = int(duration.total_seconds())
+        hours, rem = divmod(total_sec, 3600)
+        minutes, _ = divmod(rem, 60)
+
+        checkout_str = now_msk.strftime("%Y-%m-%d %H:%M:%S")
         cursor.execute(
             "UPDATE work_sessions SET check_out_time = ? WHERE session_id = ?",
-            (checkout_time_str_for_db, session_to_close_id)
+            (checkout_str, session_id)
         )
         conn.commit()
-        
-        # Шаг 6: Формируем новое, информативное сообщение (без изменений)
-        checkout_time_display = checkout_moscow_dt.strftime('%H:%M:%S')
-        message = (
-            f"✅ Вы успешно отметили уход в {checkout_time_display}.\n\n"
-            f"⏱️ **Продолжительность сессии:** {duration_str}\n\n"
+
+        logger.info(f"Check-out: user_id={internal_id}, сессия={session_id}, длительность={hours}ч {minutes}мин.")
+        return True, (
+            f"✅ Вы успешно отметили уход в {now_msk.strftime('%H:%M:%S')}.\n\n"
+            f"⏱️ Продолжительность сессии: {hours} ч {minutes:02d} мин\n\n"
             f"Хорошего вечера!"
         )
-        
-        logger.info(f"DB: Пользователь {user_id} успешно отметил уход для сессии {session_to_close_id}. Длительность: {duration_str}.")
-        return (True, message)
-
 
     except sqlite3.Error as e:
         if conn:
             conn.rollback()
-        logger.error(f"DB_ERROR: Ошибка при записи ухода для {user_id}: {e}", exc_info=True)
-        return (False, "❌ Произошла ошибка базы данных при попытке отметить уход.")
+        logger.error(f"Ошибка check-out user_id={internal_id}: {e}", exc_info=True)
+        return False, "❌ Ошибка базы данных при отметке ухода."
     finally:
         if conn:
             conn.close()
 
-        
-def reject_application(telegram_id_to_reject: int, rejecting_admin_id: int, reason: str = None): # reason пока не используется, но оставим
-    conn = None 
+
+# ------------------------------------------------------------------ #
+# Ручные отметки                                                      #
+# ------------------------------------------------------------------ #
+
+def add_manual_checkin_request(user_id: int, requested_checkin_time: datetime, vk_id: int = None) -> bool:
+    internal_id = _get_internal_user_id(
+        telegram_id=None if vk_id else user_id,
+        vk_id=vk_id,
+    ) if vk_id else _get_internal_user_id(telegram_id=user_id)
+    if not internal_id:
+        return False
+
+    conn = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        user_to_reject = get_user(telegram_id_to_reject) 
-
-        if not user_to_reject:
-            logger.warning(f"Попытка отклонить заявку несуществующего пользователя {telegram_id_to_reject} администратором {rejecting_admin_id}.")
-            return False, f"Пользователь с ID {telegram_id_to_reject} не найден в базе."
-
-        if user_to_reject['is_authorized']: 
-            logger.info(f"Попытка отклонить заявку уже авторизованного пользователя {telegram_id_to_reject}.")
-            return False, f"Пользователь ID {telegram_id_to_reject} уже авторизован. Отклонение заявки невозможно."
-        
-        if user_to_reject['application_status'] == 'rejected':
-            logger.info(f"Заявка пользователя {telegram_id_to_reject} уже была отклонена ранее.")
-            return True, f"Заявка пользователя ID {telegram_id_to_reject} уже была отклонена ранее."
-
-        if user_to_reject['application_status'] != 'pending':
-            logger.warning(f"Попытка отклонить заявку пользователя {telegram_id_to_reject} со статусом '{user_to_reject['application_status']}' (ожидался 'pending').")
-            return False, f"Заявка пользователя ID {telegram_id_to_reject} не находится в статусе 'pending' (текущий статус: {user_to_reject['application_status']})."
-
+        time_str = requested_checkin_time.strftime("%Y-%m-%d %H:%M:%S")
         cursor.execute("""
-            UPDATE users 
-            SET application_status = 'rejected', 
-                is_authorized = FALSE,
-                application_full_name = NULL,
-                application_department = NULL
-            WHERE telegram_id = ? AND application_status = 'pending'
-        """, (telegram_id_to_reject,))
+            INSERT INTO manual_checkin_requests (user_id, requested_checkin_time, request_timestamp, status)
+            VALUES (?, ?, datetime('now', 'localtime'), 'pending')
+        """, (internal_id, time_str))
         conn.commit()
-
-        if cursor.rowcount > 0:
-            logger.info(f"Заявка пользователя {telegram_id_to_reject} отклонена администратором {rejecting_admin_id}. Данные заявки очищены.")
-            return True, f"Заявка пользователя ID {telegram_id_to_reject} успешно отклонена."
-        else:
-            logger.warning(f"Не удалось отклонить заявку пользователя {telegram_id_to_reject} (rowcount=0 при UPDATE). Проверка текущего состояния...")
-            current_status_check = get_user(telegram_id_to_reject) 
-            if current_status_check:
-                if current_status_check['application_status'] == 'rejected':
-                    return True, f"Заявка пользователя ID {telegram_id_to_reject} уже была отклонена."
-                elif current_status_check['is_authorized']:
-                     return False, f"Пользователь ID {telegram_id_to_reject} уже авторизован."
-                else:
-                    return False, f"Не удалось обновить статус заявки для пользователя ID {telegram_id_to_reject} (текущий статус: {current_status_check['application_status']})."
-            else: 
-                return False, f"Не удалось найти пользователя ID {telegram_id_to_reject} после попытки отклонения."
-
-    except sqlite3.Error as e:
-        logger.error(f"Ошибка SQLite при отклонении заявки пользователя {telegram_id_to_reject}: {e}", exc_info=True)
-        return False, f"Произошла ошибка базы данных при отклонении заявки пользователя {telegram_id_to_reject}."
-    finally:
-        if conn:
-            conn.close()
-
-def get_attendance_data_for_period(start_date: datetime, end_date: datetime, sector_key: str = None) -> list:
-    """
-    Получает сырые данные о сессиях за период. Длительность будет рассчитана позже.
-    """
-    conn = get_db_connection()
-    attendance_data = []
-    try:
-        cursor = conn.cursor()
-        
-        # УБРАЛИ 'duration_minutes' ИЗ ЗАПРОСА. ОН НАМ БОЛЬШЕ НЕ НУЖЕН.
-        query = """
-            SELECT 
-                u.application_full_name,
-                u.username,
-                u.application_department,
-                ws.check_in_time AS session_start_time, 
-                ws.check_out_time AS session_end_time
-            FROM work_sessions ws
-            JOIN users u ON ws.telegram_id = u.telegram_id
-            WHERE ws.check_in_time BETWEEN ? AND ? 
-        """
-        
-        params = [start_date, end_date]
-        
-        if sector_key and sector_key.upper() != 'ALL':
-            query += " AND UPPER(u.application_department) = ? "
-            params.append(sector_key.upper())
-        
-        query += " ORDER BY u.application_full_name ASC, ws.check_in_time ASC"
-        
-        cursor.execute(query, tuple(params))
-        
-        columns = [desc[0] for desc in cursor.description]
-        for row in cursor.fetchall():
-            attendance_data.append(dict(zip(columns, row)))
-        
-        logger.info(f"DB: Получено {len(attendance_data)} записей о посещаемости для отчета.")
-    
-    except sqlite3.Error as e:
-        logger.error(f"DB: Ошибка SQLite при получении данных о посещаемости: {e}", exc_info=True)
-    finally:
-        if conn:
-            conn.close()
-    
-    return attendance_data
-
-    
-    return attendance_data
-
-
-def get_unique_departments() -> list:
-    """
-    Извлекает список уникальных непустых названий департаментов (секторов) из таблицы users.
-    """
-    conn = get_db_connection()
-    departments = []
-    try:
-        cursor = conn.cursor()
-        # Выбираем только не-NULL и непустые значения, отсортированные для единообразия
-        cursor.execute("""
-            SELECT DISTINCT application_department 
-            FROM users 
-            WHERE application_department IS NOT NULL AND application_department != ''
-            ORDER BY application_department ASC
-        """)
-        rows = cursor.fetchall()
-        # Преобразуем результат (список кортежей) в список строк
-        departments = [row['application_department'] for row in rows if row['application_department']] # Дополнительная проверка на всякий случай
-        if departments:
-            logger.info(f"DB: Получены уникальные секторы из таблицы users: {departments}")
-        else:
-            logger.info("DB: Уникальные секторы в таблице users не найдены или все пустые/NULL.")
-    except sqlite3.Error as e:
-        logger.error(f"Ошибка SQLite при получении уникальных секторов: {e}", exc_info=True)
-    except Exception as e:
-        logger.error(f"Непредвиденная ошибка при получении уникальных секторов: {e}", exc_info=True)
-    finally:
-        if conn:
-            conn.close()
-    return departments
-
-def add_manual_checkin_request(user_id: int, requested_checkin_time: datetime) -> bool:
-    """
-    Добавляет новую заявку на ручную отметку прихода в базу данных.
-    Принимает datetime объект (в МСК) и сохраняет его как текст.
-    """
-    conn = None
-    try:
-        conn = get_db_connection() 
-        cursor = conn.cursor()
-        
-        # --- НАЧАЛО ГЛАВНОГО ИСПРАВЛЕНИЯ: УПРОЩАЕМ ДО ПРЕДЕЛА ---
-        # Мы берем datetime объект (который УЖЕ в МСК из bot_main.py)
-        # и просто форматируем его в строку для SQLite. Никаких конвертаций.
-        requested_time_str = requested_checkin_time.strftime('%Y-%m-%d %H:%M:%S')
-        # --- КОНЕЦ ГЛАВНОГО ИСПРАВЛЕНИЯ ---
-        
-        # Вставляем ЧИСТУЮ строку с московским временем
-        cursor.execute("""
-            INSERT INTO manual_checkin_requests 
-            (user_id, requested_checkin_time, request_timestamp, status)
-            VALUES (?, ?, datetime('now', 'localtime'), 'pending') 
-        """, (user_id, requested_time_str))
-        conn.commit()
-        
-        # Обновляем лог, чтобы он говорил правду
-        logger.info(f"DB: Новая заявка на ручную отметку прихода добавлена для user_id={user_id}, время={requested_time_str} (МСК)")
+        logger.info(f"Заявка на ручную отметку: user_id={internal_id}, время={time_str}.")
         return True
     except sqlite3.Error as e:
-        logger.error(f"DB_ERROR: Ошибка при добавлении заявки на ручную отметку для user_id={user_id}: {e}", exc_info=True)
+        logger.error(f"Ошибка при добавлении ручной заявки: {e}", exc_info=True)
         return False
     finally:
         if conn:
             conn.close()
 
+
 def get_pending_manual_checkin_requests() -> list:
-    """
-    Возвращает список ожидающих заявок, объединенный с ПРАВИЛЬНЫМ ФИО пользователя.
-    """
     conn = None
     try:
         conn = get_db_connection()
-        conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
-        
-        sql_query = """
-            SELECT
-                req.request_id,
-                req.user_id,
-                req.requested_checkin_time,
-                req.request_timestamp,
-                u.application_full_name, -- <-- ГЛАВНОЕ ИЗМЕНЕНИЕ: Запрашиваем ФИО
-                u.username
+        cursor.execute("""
+            SELECT req.request_id, req.user_id, req.requested_checkin_time, req.request_timestamp,
+                   u.application_full_name, u.username, u.telegram_id, u.vk_id
             FROM manual_checkin_requests req
-            LEFT JOIN users u ON req.user_id = u.telegram_id -- Используем LEFT JOIN на случай, если юзера нет
+            LEFT JOIN users u ON req.user_id = u.user_id
             WHERE req.status = 'pending'
             ORDER BY req.request_timestamp ASC
-        """
-        
-        cursor.execute(sql_query)
-        requests_rows = cursor.fetchall()
-        requests_dicts = [dict(row) for row in requests_rows]
-
-
-        logger.info(f"DB: Найдено {len(requests_dicts)} ожидающих заявок на ручную отметку.")
-        return requests_dicts
-        
+        """)
+        return [dict(row) for row in cursor.fetchall()]
     except sqlite3.Error as e:
-        logger.error(f"DB_ERROR: Ошибка при получении списка ручных заявок: {e}", exc_info=True)
+        logger.error(f"Ошибка при получении ручных заявок: {e}", exc_info=True)
         return []
     finally:
         if conn:
             conn.close()
 
-def approve_all_pending_manual_checkins(admin_id: int) -> tuple[list, int]:
-    """
-    Одобряет все ожидающие заявки.
-    Возвращает список словарей с данными одобренных заявок и количество ошибок.
-    """
+
+def get_manual_checkin_request_by_id(request_id: int) -> dict | None:
     conn = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-
-
-        # Сначала получаем список всех заявок, которые мы будем обрабатывать
-        cursor.execute("SELECT * FROM manual_checkin_requests WHERE status = 'pending'")
-        pending_requests = [dict(row) for row in cursor.fetchall()]
-
-
-        if not pending_requests:
-            return [], 0
-
-
-        approved_requests_data = []
-        failed_count = 0
-        
-        processed_time_msk_str = datetime.now(MOSCOW_TZ).strftime('%Y-%m-%d %H:%M:%S')
-
-
-        for req in pending_requests:
-            try:
-                # ВАЖНО: Мы работаем внутри одной транзакции
-                request_id = req['request_id']
-                user_id = req['user_id']
-                
-                # Время уже в виде строки МСК, берем его как есть
-                checkin_time_str = req['requested_checkin_time']
-                
-                # 1. Обновляем саму заявку
-                cursor.execute("""
-                    UPDATE manual_checkin_requests
-                    SET status = 'approved', admin_id_processed = ?, processed_timestamp = ?, final_checkin_time = ?
-                    WHERE request_id = ?
-                """, (admin_id, processed_time_msk_str, checkin_time_str, request_id))
-
-
-                # 2. Создаем рабочую сессию
-                # Нам нужен sector_id пользователя для создания сессии
-                user_cursor = conn.cursor()
-                user_cursor.execute("SELECT application_department FROM users WHERE telegram_id = ?", (user_id,))
-                user_data = user_cursor.fetchone()
-                user_sector_key = user_data['application_department'] if user_data else 'unknown'
-
-
-                cursor.execute("""
-                    INSERT INTO work_sessions (telegram_id, check_in_time, checkin_type, sector_id)
-                    VALUES (?, ?, 'manual_admin', ?)
-                """, (user_id, checkin_time_str, user_sector_key))
-
-
-                # Если все успешно, добавляем данные для отправки уведомления
-                approved_requests_data.append({
-                    'user_id': user_id,
-                    'checkin_time_str': checkin_time_str
-                })
-                logger.info(f"Массовое одобрение: Заявка {request_id} для user_id={user_id} успешно обработана.")
-
-
-            except sqlite3.Error as e:
-                logger.error(f"Массовое одобрение: Ошибка при обработке заявки {req.get('request_id')}: {e}")
-                failed_count += 1
-                # Мы не откатываем транзакцию, чтобы успешные заявки сохранились
-        
-        conn.commit()
-        return approved_requests_data, failed_count
-
-
-    except sqlite3.Error as e:
-        if conn:
-            conn.rollback()
-        logger.error(f"DB_ERROR: Критическая ошибка при массовом одобрении заявок: {e}", exc_info=True)
-        return [], len(pending_requests) if 'pending_requests' in locals() else 0
-    finally:
-        if conn:
-            conn.close()
-
-
-
-
-def get_manual_checkin_request_by_id(request_id: int):
-    """
-    Возвращает детали конкретной заявки, объединенные с ПРАВИЛЬНЫМ ФИО пользователя.
-    """
-    conn = None
-    try:
-        conn = get_db_connection()
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        
         cursor.execute("""
-            SELECT 
-                mcr.request_id, 
-                mcr.user_id, 
-                mcr.requested_checkin_time,
-                mcr.status,
-                u.application_full_name, -- <-- ГЛАВНОЕ ИЗМЕНЕНИЕ: Запрашиваем ФИО
-                u.username,
-                u.application_department
+            SELECT mcr.request_id, mcr.user_id, mcr.requested_checkin_time, mcr.status,
+                   u.application_full_name, u.username, u.application_department,
+                   u.telegram_id, u.vk_id
             FROM manual_checkin_requests mcr
-            LEFT JOIN users u ON mcr.user_id = u.telegram_id -- Используем LEFT JOIN
+            LEFT JOIN users u ON mcr.user_id = u.user_id
             WHERE mcr.request_id = ?
         """, (request_id,))
-        
-        request_data_row = cursor.fetchone()
-        
-        if request_data_row:
-            logger.info(f"DB: Получена заявка на ручную отметку с ID={request_id}.")
-            return dict(request_data_row)
-        else:
-            logger.warning(f"DB: Заявка на ручную отметку с ID={request_id} не найдена.")
-            return None
-
-
+        row = cursor.fetchone()
+        return dict(row) if row else None
     except sqlite3.Error as e:
-        logger.error(f"DB_ERROR: Ошибка при получении ручной заявки по ID={request_id}: {e}", exc_info=True)
+        logger.error(f"Ошибка при получении заявки {request_id}: {e}", exc_info=True)
         return None
     finally:
         if conn:
             conn.close()
 
-def approve_manual_checkin_request(request_id: int, admin_id: int, final_checkin_time_local: datetime, user_id: int, user_sector_key: str) -> bool:
-    """
-    Одобряет заявку на ручную отметку.
-    ТЕПЕРЬ ВСЕГДА ИСПОЛЬЗУЕТ И ЗАПИСЫВАЕТ МОСКОВСКОЕ ВРЕМЯ.
-    """
+
+def approve_manual_checkin_request(
+    request_id: int,
+    admin_id: int,
+    final_checkin_time_local: datetime,
+    user_id: int,
+    user_sector_key: str,
+) -> bool:
+    admin_internal = _get_internal_user_id(telegram_id=admin_id)
+    admin_internal = admin_internal or admin_id
+
+    internal_user = _get_internal_user_id(telegram_id=user_id) or user_id
+    logger.info(f"approve: request_id={request_id}, admin_id={admin_id}→{admin_internal}, user_id={user_id}→{internal_user}")
+
+    conn_check = get_db_connection()
+    exists = conn_check.execute("SELECT 1 FROM users WHERE user_id=?", (internal_user,)).fetchone()
+    conn_check.close()
+    logger.info(f"approve: exists={exists}")
+    if not exists:
+        return False
+
     conn = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        
-        # --- НАЧАЛО ГЛАВНОГО ИСПРАВЛЕНИЯ: ВОЗВРАЩАЕМСЯ К ПРОСТОМУ MSK ---
-        # Входное время final_checkin_time_local - это уже МОСКОВСКОЕ время.
-        # Просто превращаем его в строку для записи в базу.
-        checkin_time_msk_str_for_db = final_checkin_time_local.strftime('%Y-%m-%d %H:%M:%S')
-        
-        # Время обработки заявки тоже берем в московском времени.
-        processed_time_msk_str = datetime.now(MOSCOW_TZ).strftime('%Y-%m-%d %H:%M:%S')
-        # --- КОНЕЦ ГЛАВНОГО ИСПРАВЛЕНИЯ ---
+        checkin_str = final_checkin_time_local.strftime("%Y-%m-%d %H:%M:%S")
+        processed_str = datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
-
-        # Обновляем саму заявку, используя МОСКОВСКОЕ время
         cursor.execute("""
             UPDATE manual_checkin_requests
-            SET status = 'approved',
-                admin_id_processed = ?, 
-                processed_timestamp = ?,
-                final_checkin_time = ?
+            SET status = 'approved', admin_user_id = ?, processed_timestamp = ?, final_checkin_time = ?
             WHERE request_id = ? AND status = 'pending'
-        """, (admin_id, processed_time_msk_str, checkin_time_msk_str_for_db, request_id))
-        
+        """, (admin_internal, processed_str, checkin_str, request_id))
+
         if cursor.rowcount == 0:
-            logger.warning(f"DB: Не удалось обновить заявку {request_id} для одобрения (возможно, уже обработана).")
             conn.rollback()
+            logger.warning(f"approve: rowcount=0 для request_id={request_id}, возможно уже обработана")
             return False
 
-
-        # Создаем рабочую сессию, используя МОСКОВСКОЕ время
         cursor.execute("""
-            INSERT INTO work_sessions (telegram_id, check_in_time, checkin_type, sector_id)
+            INSERT INTO work_sessions (user_id, check_in_time, checkin_type, sector_id)
             VALUES (?, ?, 'manual_admin', ?)
-        """, (user_id, checkin_time_msk_str_for_db, user_sector_key))
-        
-        conn.commit()
-        
-        logger.info(f"DB: Заявка {request_id} одобрена. Создана сессия для user_id={user_id}, сектор='{user_sector_key}', время='{checkin_time_msk_str_for_db}' (МСК).")
-        return True
+        """, (internal_user, checkin_str, user_sector_key))
 
+        conn.commit()
+        logger.info(f"Заявка {request_id} одобрена. Сессия создана для user_id={internal_user}.")
+        return True
 
     except sqlite3.Error as e:
         if conn:
             conn.rollback()
-        logger.error(f"DB_ERROR: Ошибка при одобрении ручной заявки {request_id}: {e}", exc_info=True)
+        logger.error(f"Ошибка при одобрении заявки {request_id}: {e}", exc_info=True)
         return False
+    finally:
+        if conn:
+            conn.close()
+
+
+def approve_all_pending_manual_checkins(admin_id: int) -> tuple[list, int]:
+    """admin_id — telegram_id администратора (обратная совместимость)."""
+    admin_internal = _get_internal_user_id(telegram_id=admin_id) or admin_id
+
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM manual_checkin_requests WHERE status = 'pending'")
+        pending = [dict(row) for row in cursor.fetchall()]
+
+        if not pending:
+            return [], 0
+
+        approved = []
+        failed = 0
+        processed_str = datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+        for req in pending:
+            try:
+                cursor.execute("""
+                    UPDATE manual_checkin_requests
+                    SET status = 'approved', admin_user_id = ?, processed_timestamp = ?, final_checkin_time = ?
+                    WHERE request_id = ?
+                """, (admin_internal, processed_str, req["requested_checkin_time"], req["request_id"]))
+
+                cursor.execute("SELECT application_department FROM users WHERE user_id = ?", (req["user_id"],))
+                u = cursor.fetchone()
+                sector = u["application_department"] if u else "unknown"
+
+                cursor.execute("""
+                    INSERT INTO work_sessions (user_id, check_in_time, checkin_type, sector_id)
+                    VALUES (?, ?, 'manual_admin', ?)
+                """, (req["user_id"], req["requested_checkin_time"], sector))
+
+                approved.append({"user_id": req["user_id"], "checkin_time_str": req["requested_checkin_time"]})
+            except sqlite3.Error as e:
+                logger.error(f"Ошибка при массовом одобрении заявки {req.get('request_id')}: {e}")
+                failed += 1
+
+        conn.commit()
+        return approved, failed
+
+    except sqlite3.Error as e:
+        if conn:
+            conn.rollback()
+        logger.error(f"Критическая ошибка при массовом одобрении: {e}", exc_info=True)
+        return [], len(pending) if "pending" in locals() else 0
     finally:
         if conn:
             conn.close()
 
 
 def reject_manual_checkin_request(request_id: int, admin_id: int) -> bool:
-    """
-    Отклоняет заявку на ручную отметку и обновляет ее статус.
-    ТЕПЕРЬ ЗАПИСЫВАЕТ ВРЕМЯ ОБРАБОТКИ В МСК.
-    """
+    admin_internal = _get_internal_user_id(telegram_id=admin_id) or admin_id
     conn = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        
-        # --- НАЧАЛО ГЛАВНОГО ИСПРАВЛЕНИЯ ---
-        # Время обработки теперь всегда в МСК для консистентности
-        processed_time_msk_str = datetime.now(MOSCOW_TZ).strftime('%Y-%m-%d %H:%M:%S')
-        # --- КОНЕЦ ГЛАВНОГО ИСПРАВЛЕНИЯ ---
-
-
+        processed_str = datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d %H:%M:%S")
         cursor.execute("""
             UPDATE manual_checkin_requests
-            SET status = 'rejected',
-                admin_id_processed = ?,
-                processed_timestamp = ?
+            SET status = 'rejected', admin_user_id = ?, processed_timestamp = ?
             WHERE request_id = ? AND status = 'pending'
-        """, (admin_id, processed_time_msk_str, request_id))
-        
-        if cursor.rowcount == 0:
-            logger.warning(f"DB: Не удалось отклонить заявку {request_id} (возможно, уже обработана или не найдена).")
-            return False
-            
+        """, (admin_internal, processed_str, request_id))
         conn.commit()
-        logger.info(f"DB: Заявка {request_id} отклонена админом {admin_id}.")
-        return True
+        return cursor.rowcount > 0
     except sqlite3.Error as e:
-        logger.error(f"DB_ERROR: Ошибка при отклонении ручной заявки {request_id}: {e}", exc_info=True)
+        logger.error(f"Ошибка при отклонении заявки {request_id}: {e}", exc_info=True)
         return False
     finally:
         if conn:
             conn.close()
 
 
-def get_unique_user_departments() -> list:
-    """
-    Возвращает отсортированный список уникальных департаментов из таблицы users.
-    """
-    conn = None
+# ------------------------------------------------------------------ #
+# Отчёты и статистика                                                 #
+# ------------------------------------------------------------------ #
+
+def get_attendance_data_for_period(start_date: datetime, end_date: datetime, sector_key: str = None) -> list:
+    conn = get_db_connection()
     try:
-        conn = get_db_connection()
         cursor = conn.cursor()
-        # ИСПОЛЬЗУЕМ ПРАВИЛЬНОЕ ИМЯ КОЛОНКИ: application_department
-        cursor.execute("SELECT DISTINCT application_department FROM users WHERE application_department IS NOT NULL AND application_department != '' ORDER BY application_department ASC")
-        return [row[0] for row in cursor.fetchall()]
-    except sqlite3.Error as e:
-        logger.error(f"DB_ERROR: Ошибка при получении списка уникальных департаментов: {e}", exc_info=True)
-        return []
-    finally:
-        if conn:
-            conn.close()
-
-
-
-def get_active_users_by_department(department: str) -> list:
-    """
-    Возвращает УНИКАЛЬНЫЙ список пользователей на смене с их ПОСЛЕДНЕЙ активной сессией.
-    "На смене" означает, что сессия открыта ПОСЛЕ 5 утра текущего рабочего дня.
-    """
-    conn = None
-    try:
-        # --- НАЧАЛО НОВОЙ ЛОГИКИ: ВЫЧИСЛЕНИЕ ТОЧКИ ОТСЕЧКИ ---
-        
-        # 1. Получаем текущее время в Москве
-        now_moscow = datetime.now(MOSCOW_TZ)
-        
-        # 2. Устанавливаем время отсечки на 5 утра СЕГОДНЯШНЕГО дня
-        cutoff_time_moscow = now_moscow.replace(hour=5, minute=0, second=0, microsecond=0)
-        
-        # 3. Если сейчас раньше 5 утра (например, 4:59), то "рабочий день" еще вчерашний.
-        #    Значит, точкой отсечки должно быть 5 утра ВЧЕРА.
-        if now_moscow < cutoff_time_moscow:
-            cutoff_time_moscow -= timedelta(days=1)
-            
-        # 4. Превращаем "умный" объект времени в строку для SQL-запроса
-        cutoff_time_str = cutoff_time_moscow.strftime('%Y-%m-%d %H:%M:%S')
-
-        # --- КОНЕЦ НОВОЙ ЛОГИКИ ---
-
-        conn = get_db_connection()
-        conn.row_factory = sqlite3.Row 
-        cursor = conn.cursor()
-
-        # --- ОБНОВЛЕННЫЙ SQL-ЗАПРОС ---
-        sql_query = """
+        query = """
             SELECT
                 u.application_full_name,
                 u.username,
                 u.application_department,
-                t.max_check_in_time AS check_in_time
-            FROM (
-                SELECT
-                    telegram_id,
-                    MAX(check_in_time) AS max_check_in_time
-                FROM work_sessions
-                WHERE 
-                    check_out_time IS NULL 
-                    -- НАШЕ НОВОЕ УСЛОВИЕ "КОМЕНДАНТСКОГО ЧАСА"
-                    AND check_in_time >= ? 
-                GROUP BY telegram_id
-            ) AS t
-            JOIN users u ON t.telegram_id = u.telegram_id
-            WHERE
-                (? = 'ALL' OR u.application_department = ?)
-            ORDER BY
-                u.application_department, u.application_full_name ASC;
+                ws.check_in_time  AS session_start_time,
+                ws.check_out_time AS session_end_time
+            FROM work_sessions ws
+            JOIN users u ON ws.user_id = u.user_id
+            WHERE ws.check_in_time BETWEEN ? AND ?
         """
-        
-        # Передаем в запрос ТРИ параметра: отсечку времени и дважды департамент
-        cursor.execute(sql_query, (cutoff_time_str, department, department))
-        results = cursor.fetchall()
-        
-        logger.info(f"DB_INFO: Умный запрос для /on_shift (отсечка: {cutoff_time_str}) вернул {len(results)} строк.")
-        return results
+        params = [start_date, end_date]
+        if sector_key and sector_key.upper() != "ALL":
+            query += " AND UPPER(u.application_department) = ? "
+            params.append(sector_key.upper())
+        query += " ORDER BY u.application_full_name ASC, ws.check_in_time ASC"
 
+        cursor.execute(query, tuple(params))
+        columns = [d[0] for d in cursor.description]
+        return [dict(zip(columns, row)) for row in cursor.fetchall()]
     except sqlite3.Error as e:
-        logger.error(f"DB_ERROR: Ошибка при получении активных пользователей для департамента '{department}': {e}", exc_info=True)
+        logger.error(f"Ошибка при получении данных посещаемости: {e}", exc_info=True)
+        return []
+    finally:
+        conn.close()
+
+
+def get_unique_departments() -> list:
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT DISTINCT application_department FROM users
+            WHERE application_department IS NOT NULL AND application_department != ''
+            ORDER BY application_department ASC
+        """)
+        return [row[0] for row in cursor.fetchall()]
+    except sqlite3.Error as e:
+        logger.error(f"Ошибка при получении секторов: {e}", exc_info=True)
+        return []
+    finally:
+        conn.close()
+
+
+def get_unique_user_departments() -> list:
+    return get_unique_departments()
+
+
+def get_active_users_by_department(department: str) -> list:
+    conn = None
+    try:
+        now_msk = datetime.now(MOSCOW_TZ)
+        cutoff = now_msk.replace(hour=5, minute=0, second=0, microsecond=0)
+        if now_msk < cutoff:
+            cutoff -= timedelta(days=1)
+        cutoff_str = cutoff.strftime("%Y-%m-%d %H:%M:%S")
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT u.application_full_name, u.username, u.application_department,
+                   t.max_check_in_time AS check_in_time
+            FROM (
+                SELECT user_id, MAX(check_in_time) AS max_check_in_time
+                FROM work_sessions
+                WHERE check_out_time IS NULL AND check_in_time >= ?
+                GROUP BY user_id
+            ) AS t
+            JOIN users u ON t.user_id = u.user_id
+            WHERE (? = 'ALL' OR u.application_department = ?)
+            ORDER BY u.application_department, u.application_full_name ASC
+        """, (cutoff_str, department, department))
+        return [dict(row) for row in cursor.fetchall()]
+    except sqlite3.Error as e:
+        logger.error(f"Ошибка при получении активных пользователей: {e}", exc_info=True)
         return []
     finally:
         if conn:
             conn.close()
-            
+
+
 def find_users_by_name(name_part: str) -> list:
-    """
-    Ищет пользователей в базе по части их полного имени (application_full_name).
-    Поиск нечувствителен к регистру.
-    Возвращает список словарей с telegram_id и application_full_name.
-    """
     conn = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        
-        # Используем LIKE для поиска по подстроке
-        # LOWER() делает поиск нечувствительным к регистру
-        sql_query = """
-            SELECT telegram_id, application_full_name
+        cursor.execute("""
+            SELECT user_id, telegram_id, vk_id, application_full_name
             FROM users
-            WHERE LOWER(application_full_name) LIKE LOWER(?)
-            AND is_authorized = 1
-            ORDER BY application_full_name;
-        """
-        
-        # Добавляем '%' к строке поиска, чтобы искать вхождения
-        search_term = f"%{name_part}%"
-        
-        cursor.execute(sql_query, (search_term,))
-        users = [dict(row) for row in cursor.fetchall()]
-        
-        logger.info(f"DB: Поиск по имени '{name_part}' нашел {len(users)} пользователей.")
-        return users
-
+            WHERE LOWER(application_full_name) LIKE LOWER(?) AND is_authorized = 1
+            ORDER BY application_full_name
+        """, (f"%{name_part}%",))
+        return [dict(row) for row in cursor.fetchall()]
     except sqlite3.Error as e:
-        logger.error(f"DB_ERROR: Ошибка при поиске пользователей по имени '{name_part}': {e}", exc_info=True)
+        logger.error(f"Ошибка при поиске по имени '{name_part}': {e}", exc_info=True)
         return []
     finally:
         if conn:
@@ -952,136 +985,71 @@ def find_users_by_name(name_part: str) -> list:
 
 
 def get_completed_sessions_for_user(user_id: int, period: str) -> list:
-    """
-    (ДИАГНОСТИЧЕСКАЯ ВЕРСИЯ)
-    Эта функция распечатает КАЖДОЕ сравнение дат, чтобы мы увидели, почему оно дает сбой.
-    """
+    """user_id здесь — telegram_id (обратная совместимость)."""
+    internal_id = _get_internal_user_id(telegram_id=user_id)
+    if not internal_id:
+        return []
+
     conn = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-
-        sql_query = """
+        cursor.execute("""
             SELECT session_id, check_in_time, check_out_time
             FROM work_sessions
-            WHERE telegram_id = ? AND check_out_time IS NOT NULL
+            WHERE user_id = ? AND check_out_time IS NOT NULL
             ORDER BY check_in_time DESC
-        """
-        
-        cursor.execute(sql_query, (user_id,))
+        """, (internal_id,))
         all_sessions = [dict(row) for row in cursor.fetchall()]
 
-        if period == 'last5':
+        if period == "last5":
             return all_sessions[:5]
 
-        elif period == 'week':
-            cutoff_date = datetime.now(MOSCOW_TZ) - timedelta(days=7)
-        elif period == 'month':
-            cutoff_date = datetime.now(MOSCOW_TZ) - timedelta(days=30)
-        else:
-            return []
-            
-        logger.info("="*50)
-        logger.info(f"НАЧАЛО ДИАГНОСТИКИ ФИЛЬТРА ДЛЯ ПЕРИОДА '{period}'")
-        logger.info(f"ДАТА ОТСЕЧКИ (cutoff_date): {cutoff_date}")
-        logger.info("="*50)
-            
-        filtered_sessions = []
-        for session in all_sessions:
+        days = 7 if period == "week" else 30
+        cutoff = datetime.now(MOSCOW_TZ) - timedelta(days=days)
+
+        result = []
+        for s in all_sessions:
             try:
-                session_dt_naive = datetime.strptime(session['check_in_time'], '%Y-%m-%d %H:%M:%S')
-                session_dt_aware = MOSCOW_TZ.localize(session_dt_naive)
-                
-                # --- ГЛАВНЫЙ ДИАГНОСТИЧЕСКИЙ БЛОК ---
-                comparison_result = session_dt_aware >= cutoff_date
-                logger.info(f"--- СРАВНЕНИЕ ДЛЯ СЕССИИ ID {session['session_id']} ---")
-                logger.info(f"    Дата из БД (строка): {session['check_in_time']}")
-                logger.info(f"    Дата из БД (объект):  {session_dt_aware}")
-                logger.info(f"    РЕЗУЛЬТАТ СРАВНЕНИЯ (>=): {comparison_result}")
-                # --- КОНЕЦ БЛОКА ---
-
-                if comparison_result:
-                    filtered_sessions.append(session)
-            except Exception as e:
-                logger.error(f"ОШИБКА при обработке сессии ID {session['session_id']}: {e}")
+                dt = MOSCOW_TZ.localize(datetime.strptime(s["check_in_time"], "%Y-%m-%d %H:%M:%S"))
+                if dt >= cutoff:
+                    result.append(s)
+            except (ValueError, TypeError):
                 continue
-        
-        logger.info("="*50)
-        logger.info("ДИАГНОСТИКА ФИЛЬТРА ЗАВЕРШЕНА")
-        logger.info("="*50)
-        
-        return filtered_sessions
-
+        return result
     except sqlite3.Error as e:
-        logger.error(f"DB_ERROR: Ошибка при получении сессий для {user_id}: {e}", exc_info=True)
+        logger.error(f"Ошибка при получении сессий: {e}", exc_info=True)
         return []
     finally:
         if conn:
             conn.close()
 
 
-
 def update_session_checkout_time(session_id: int, new_checkout_time_str: str) -> bool:
-    """
-    Обновляет время ухода для конкретной сессии И ПЕРЕСЧИТЫВАЕТ ДЛИТЕЛЬНОСТЬ.
-    Возвравращает True в случае успеха, False в случае ошибки.
-    """
     conn = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        
-        # Шаг 1: Получаем время прихода, чтобы посчитать новую длительность
         cursor.execute("SELECT check_in_time FROM work_sessions WHERE session_id = ?", (session_id,))
-        result = cursor.fetchone()
-        if not result:
-            logger.error(f"DB_ERROR: Не удалось найти сессию {session_id} для обновления.")
+        row = cursor.fetchone()
+        if not row:
             return False
-            
-        check_in_time_str = result['check_in_time']
-        
-        # Шаг 2: Считаем новую длительность в минутах
-        check_in_dt = datetime.strptime(check_in_time_str, '%Y-%m-%d %H:%M:%S')
-        new_checkout_dt = datetime.strptime(new_checkout_time_str, '%Y-%m-%d %H:%M:%S')
-        new_duration = (new_checkout_dt - check_in_dt).total_seconds() / 60
-        new_duration_minutes = int(new_duration) # Убеждаемся, что это целое число
 
-        # Шаг 3: Обновляем ОБА поля в одной транзакции
-        sql_query = """
-            UPDATE work_sessions 
-            SET 
-                check_out_time = ?, 
-                duration_minutes = ? 
-            WHERE 
-                session_id = ?;
-        """
-        cursor.execute(sql_query, (new_checkout_time_str, new_duration_minutes, session_id))
+        check_in = datetime.strptime(row["check_in_time"], "%Y-%m-%d %H:%M:%S")
+        check_out = datetime.strptime(new_checkout_time_str, "%Y-%m-%d %H:%M:%S")
+        duration_min = int((check_out - check_in).total_seconds() / 60)
+
+        cursor.execute("""
+            UPDATE work_sessions SET check_out_time = ?, duration_minutes = ?
+            WHERE session_id = ?
+        """, (new_checkout_time_str, duration_min, session_id))
         conn.commit()
-        
-        if cursor.rowcount > 0:
-            logger.info(f"DB: Сессия {session_id} успешно обновлена. Новое время ухода: {new_checkout_time_str}, новая длительность: {new_duration_minutes} мин.")
-            return True
-        else:
-            logger.warning(f"DB: Не удалось обновить сессию {session_id} (rowcount = 0).")
-            return False
-
+        return cursor.rowcount > 0
     except (sqlite3.Error, ValueError, TypeError) as e:
-        logger.error(f"DB_ERROR: Ошибка при обновлении сессии {session_id}: {e}", exc_info=True)
+        logger.error(f"Ошибка при обновлении сессии {session_id}: {e}", exc_info=True)
         if conn:
-            conn.rollback() # Откатываем изменения в случае ошибки
+            conn.rollback()
         return False
     finally:
         if conn:
             conn.close()
-
-
-
-
-
-
-
-
-
-
-
-

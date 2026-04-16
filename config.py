@@ -36,4 +36,9 @@ SECTOR_SCHEDULES = {
     'СС': {'start_hour': 10, 'end_hour': 19},
 }
 
+# --- VK ---
+VK_GROUP_TOKEN = os.getenv("VK_GROUP_TOKEN", "")
+vk_admin_ids_str = os.getenv("VK_ADMIN_IDS", "")
+VK_ADMIN_IDS = [int(i.strip()) for i in vk_admin_ids_str.split(",") if i.strip()]
 
+PREDEFINED_SECTORS = ["Сектор СС", "Сектор ВИ", "Сектор ОП"]
