@@ -84,6 +84,7 @@ ASK_FULL_NAME, ASK_DEPARTMENT = range(APP_CONV_START_STATE, APP_CONV_START_STATE
 # Новое состояние для запроса времени ручной отметки прихода
 MANUAL_CHECKIN_CONV_START_STATE = 20 # Выбираем новый диапазон
 REQUEST_MANUAL_CHECKIN_TIME = MANUAL_CHECKIN_CONV_START_STATE # Будет 20
+CONFIRM_MANUAL_CHECKIN_OPEN = 21 # Подтверждение продолжения при наличии открытой сессии
 
 # Состояния для административного диалога обработки ручных заявок
 ADMIN_MANUAL_CHECKINS_STATE_START = 30 # Выбираем новый диапазон, не пересекающийся с другими
@@ -1357,21 +1358,6 @@ async def checkin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         db.authorize_user(user.id, user.id)
         logger.info(f"Администратор {user.id} ({user.username}) автоматически добавлен/авторизован при попытке /checkin.")
 
-    if db.has_open_session(telegram_id=user.id):
-        confirm_keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ Да, всё равно отметить приход", callback_data="checkin_confirm_open_session"),
-            InlineKeyboardButton("❌ Отмена", callback_data="checkin_cancel_open_session"),
-        ]])
-        await update.message.reply_text(
-            escape_markdown_v2(
-                "⚠️ У вас уже есть открытая (незакрытая) сессия — приход без отметки ухода.\n"
-                "Вы уверены, что хотите отметить приход ещё раз?"
-            ),
-            reply_markup=confirm_keyboard,
-            parse_mode=ParseMode.MARKDOWN_V2
-        )
-        return
-
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton(
             "📍 Отметить приход",
@@ -1382,30 +1368,6 @@ async def checkin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         escape_markdown_v2("Нажмите кнопку для отметки прихода:"),
         reply_markup=keyboard,
         parse_mode=ParseMode.MARKDOWN_V2
-    )
-
-
-async def checkin_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обрабатывает подтверждение/отмену отметки прихода при наличии открытой сессии."""
-    query = update.callback_query
-    await query.answer()
-    user = query.from_user
-
-    if query.data == "checkin_cancel_open_session":
-        await query.edit_message_text("Отметка прихода отменена.")
-        return
-
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton(
-            "📍 Отметить приход",
-            web_app=WebAppInfo(url=f"https://tabel-opk.ru/static/checkin.html?telegram_id={user.id}")
-        )
-    ]])
-    await query.edit_message_text("Нажмите кнопку для отметки прихода:")
-    await context.bot.send_message(
-        chat_id=user.id,
-        text="Нажмите кнопку для отметки прихода:",
-        reply_markup=keyboard
     )
 
 async def checkout_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1540,7 +1502,8 @@ def is_within_office_zone(latitude: float, longitude: float) -> bool:
 async def request_manual_checkin_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """
     Начинает диалог запроса ручной отметки прихода.
-    Запрашивает у пользователя фактическое время прихода.
+    Если есть открытая сессия — сначала спрашивает подтверждение,
+    и только после согласия запрашивает фактическое время прихода.
     """
     user = update.effective_user
     logger.info(f"User {user.id} ({user.username}) инициировал запрос на ручную отметку прихода (/request_manual_checkin).")
@@ -1551,19 +1514,42 @@ async def request_manual_checkin_start(update: Update, context: ContextTypes.DEF
         await update.message.reply_text("Эта функция доступна только для авторизованных пользователей.")
         return ConversationHandler.END
 
-    warning_text = ""
     if db.has_open_session(telegram_id=user.id):
-        warning_text = (
-            "⚠️ У вас уже есть открытая (незакрытая) сессия — приход без отметки ухода. "
-            "Если вы хотите отметить именно приход, а не уход, убедитесь, что это действительно нужно.\n\n"
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Да, продолжить", callback_data="manual_checkin_confirm_open"),
+            InlineKeyboardButton("❌ Отмена", callback_data="manual_checkin_cancel_open"),
+        ]])
+        await update.message.reply_text(
+            "⚠️ У вас уже есть открытая (незакрытая) сессия — приход без отметки ухода.\n"
+            "Вы уверены, что хотите запросить ручную отметку прихода?",
+            reply_markup=keyboard
         )
+        return CONFIRM_MANUAL_CHECKIN_OPEN
 
     await update.message.reply_text(
-        warning_text +
         "Вы хотите запросить ручную отметку прихода.\n"
         "Пожалуйста, укажите фактическое время вашего прихода в формате **ДД.ММ.ГГГГ ЧЧ:ММ** "
         "(например, `15.06.2025 09:05`).\n\n"
         "Для отмены введите /cancel_manual_checkin"
+    )
+    return REQUEST_MANUAL_CHECKIN_TIME
+
+
+async def manual_checkin_confirm_open_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Обрабатывает ответ на предупреждение об открытой сессии перед ручной отметкой."""
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "manual_checkin_cancel_open":
+        await query.edit_message_text("Запрос на ручную отметку прихода отменён.")
+        return ConversationHandler.END
+
+    await query.edit_message_text(
+        "Вы хотите запросить ручную отметку прихода.\n"
+        "Пожалуйста, укажите фактическое время вашего прихода в формате **ДД.ММ.ГГГГ ЧЧ:ММ** "
+        "(например, `15.06.2025 09:05`).\n\n"
+        "Для отмены введите /cancel_manual_checkin",
+        parse_mode=ParseMode.MARKDOWN_V2
     )
     return REQUEST_MANUAL_CHECKIN_TIME
 
@@ -3516,6 +3502,9 @@ def main() -> None:
     manual_checkin_conv_handler = ConversationHandler(
         entry_points=[CommandHandler("request_manual_checkin", request_manual_checkin_start)],
         states={
+            CONFIRM_MANUAL_CHECKIN_OPEN: [
+                CallbackQueryHandler(manual_checkin_confirm_open_callback, pattern="^manual_checkin_(confirm|cancel)_open$")
+            ],
             REQUEST_MANUAL_CHECKIN_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_manual_checkin_time)],
         },
         fallbacks=[CommandHandler("cancel_manual_checkin", cancel_manual_checkin_dialog)],
@@ -3619,7 +3608,6 @@ def main() -> None:
     application.add_handler(MessageHandler(filters.LOCATION, location_handler))
     
     application.add_handler(CallbackQueryHandler(on_shift_button_press, pattern=r"^on_shift_"))
-    application.add_handler(CallbackQueryHandler(checkin_confirm_callback, pattern=r"^checkin_(confirm|cancel)_open_session$"))
     application.add_handler(CallbackQueryHandler(admin_action_callback_handler, pattern=r'^(view_user_app:|card_auth_app:|card_reject_app:|focus_in_list:|paginate_list:)'))
     
     # --- ЗАПУСК БОТА ---

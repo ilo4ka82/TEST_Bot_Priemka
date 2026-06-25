@@ -293,22 +293,20 @@ async def _handle_ask_department(message: Message, text: str):
 
 
 async def _handle_confirm_checkin_open(message: Message, text: str):
-    """Обрабатывает ответ пользователя на предупреждение об открытой сессии перед отметкой прихода."""
+    """Обрабатывает ответ пользователя на предупреждение об открытой сессии перед ручной отметкой прихода."""
     vk_id = message.from_id
-    sm.clear("vk", vk_id)
 
-    if text != "✅ Да, всё равно отметить приход":
-        await message.answer("Отметка прихода отменена.", keyboard=make_main_keyboard(vk_id))
+    if text != "✅ Да, продолжить":
+        sm.clear("vk", vk_id)
+        await message.answer("Запрос на ручную отметку прихода отменён.", keyboard=make_main_keyboard(vk_id))
         return
 
-    from vkbottle import Keyboard as KB, OpenLink
-    kb = KB(inline=True)
-    kb.add(OpenLink(
-        link=f"https://tabel-opk.ru/static/checkin.html?vk_id={vk_id}",
-        label="📍 Отметить приход"
-    ))
-    await message.answer("Хорошо, нажмите кнопку для отметки прихода:", keyboard=make_main_keyboard(vk_id))
-    await message.answer("Нажмите кнопку для отметки прихода:", keyboard=kb)
+    sm.set_state("vk", vk_id, REQUEST_MANUAL_CHECKIN)
+    await message.answer(
+        "Вы хотите запросить ручную отметку прихода.\n"
+        "Пожалуйста, укажите фактическое время вашего прихода в формате ДД.ММ.ГГГГ ЧЧ:ММ "
+        "(например, 13.06.2026 09:05).\n\nДля отмены: отмена"
+    )
 
 
 async def _handle_manual_checkin_time(message: Message, text: str):
@@ -365,19 +363,6 @@ async def handle_buttons(message: Message, text: str):
     if text == "📍 Отметить приход":
         if not authed and not is_admin(vk_id):
             await message.answer("❌ Вы не авторизованы.", keyboard=make_unauth_keyboard()); return
-
-        if db.has_open_session(vk_id=vk_id):
-            kb = Keyboard(one_time=True)
-            kb.add(Text("✅ Да, всё равно отметить приход"), color=KeyboardButtonColor.POSITIVE)
-            kb.add(Text("❌ Отмена"), color=KeyboardButtonColor.NEGATIVE)
-            sm.set_state("vk", vk_id, CONFIRM_CHECKIN_OPEN)
-            await message.answer(
-                "⚠️ У вас уже есть открытая (незакрытая) сессия — приход без отметки ухода.\n"
-                "Вы уверены, что хотите отметить приход ещё раз?",
-                keyboard=kb
-            )
-            return
-
         from vkbottle import Keyboard as KB, OpenLink
         kb = KB(inline=True)
         kb.add(OpenLink(
@@ -396,15 +381,21 @@ async def handle_buttons(message: Message, text: str):
     if text == "🕐 Ручная отметка":
         if not authed and not is_admin(vk_id):
             await message.answer("❌ Вы не авторизованы.", keyboard=make_unauth_keyboard()); return
-        sm.set_state("vk", vk_id, REQUEST_MANUAL_CHECKIN)
-        warning_text = ""
+
         if db.has_open_session(vk_id=vk_id):
-            warning_text = (
-                "⚠️ У вас уже есть открытая (незакрытая) сессия — приход без отметки ухода. "
-                "Если вы хотите отметить именно приход, а не уход, убедитесь, что это действительно нужно.\n\n"
+            kb = Keyboard(one_time=True)
+            kb.add(Text("✅ Да, продолжить"), color=KeyboardButtonColor.POSITIVE)
+            kb.add(Text("❌ Отмена"), color=KeyboardButtonColor.NEGATIVE)
+            sm.set_state("vk", vk_id, CONFIRM_CHECKIN_OPEN)
+            await message.answer(
+                "⚠️ У вас уже есть открытая (незакрытая) сессия — приход без отметки ухода.\n"
+                "Вы уверены, что хотите запросить ручную отметку прихода?",
+                keyboard=kb
             )
+            return
+
+        sm.set_state("vk", vk_id, REQUEST_MANUAL_CHECKIN)
         await message.answer(
-            warning_text +
             "Вы хотите запросить ручную отметку прихода.\n"
             "Пожалуйста, укажите фактическое время вашего прихода в формате ДД.ММ.ГГГГ ЧЧ:ММ "
             "(например, 13.06.2026 09:05).\n\nДля отмены: отмена"
