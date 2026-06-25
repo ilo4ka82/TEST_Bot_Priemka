@@ -494,6 +494,33 @@ def _get_internal_user_id(telegram_id: int = None, vk_id: int = None) -> int | N
     return user["user_id"] if user else None
 
 
+def has_open_session(telegram_id: int = None, vk_id: int = None) -> bool:
+    """
+    Проверяет, есть ли у пользователя незакрытая (открытая) сессия —
+    то есть отметка прихода без отметки ухода.
+    Используется как предупреждение перед ручной отметкой или отметкой через домен.
+    """
+    internal_id = _get_internal_user_id(telegram_id=telegram_id, vk_id=vk_id)
+    if not internal_id:
+        return False
+
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT session_id FROM work_sessions WHERE user_id = ? AND check_out_time IS NULL",
+            (internal_id,)
+        )
+        return cursor.fetchone() is not None
+    except sqlite3.Error as e:
+        logger.error(f"Ошибка при проверке открытой сессии (telegram_id={telegram_id}, vk_id={vk_id}): {e}", exc_info=True)
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+
 def record_check_in(
     user_id: int,
     latitude: float,
@@ -826,16 +853,23 @@ def approve_all_pending_manual_checkins(admin_id: int) -> tuple[list, int]:
                     WHERE request_id = ?
                 """, (admin_internal, processed_str, req["requested_checkin_time"], req["request_id"]))
 
-                cursor.execute("SELECT application_department FROM users WHERE user_id = ?", (req["user_id"],))
+                cursor.execute("SELECT application_department, telegram_id, vk_id FROM users WHERE user_id = ?", (req["user_id"],))
                 u = cursor.fetchone()
                 sector = u["application_department"] if u else "unknown"
+                tg_id = u["telegram_id"] if u else None
+                vk_id = u["vk_id"] if u else None
 
                 cursor.execute("""
                     INSERT INTO work_sessions (user_id, check_in_time, checkin_type, sector_id)
                     VALUES (?, ?, 'manual_admin', ?)
                 """, (req["user_id"], req["requested_checkin_time"], sector))
 
-                approved.append({"user_id": req["user_id"], "checkin_time_str": req["requested_checkin_time"]})
+                approved.append({
+                    "user_id": req["user_id"],
+                    "telegram_id": tg_id,
+                    "vk_id": vk_id,
+                    "checkin_time_str": req["requested_checkin_time"]
+                })
             except sqlite3.Error as e:
                 logger.error(f"Ошибка при массовом одобрении заявки {req.get('request_id')}: {e}")
                 failed += 1

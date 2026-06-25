@@ -6,6 +6,7 @@ import os
 import ssl
 ssl._create_default_https_context = ssl._create_unverified_context
 
+import httpx
 import logging
 from datetime import datetime, date, timedelta
 import pytz
@@ -14,7 +15,7 @@ from vkbottle import Bot, Keyboard, KeyboardButtonColor, Text
 from vkbottle.bot import Message
 
 import database_operations as db
-from config import VK_GROUP_TOKEN, VK_ADMIN_IDS, PREDEFINED_SECTORS
+from config import VK_GROUP_TOKEN, VK_ADMIN_IDS, PREDEFINED_SECTORS, TELEGRAM_BOT_TOKEN
 from services.attendance import is_within_office_zone
 from services.export import generate_excel_report
 from services.state_manager import StateManager, END
@@ -51,6 +52,7 @@ ADMIN_MANUAL_LIST        = 80   # список ручных заявок
 ADMIN_MANUAL_DETAIL      = 81   # детали одной заявки
 ADMIN_MANUAL_NEW_TIME    = 82   # ввод нового времени
 ADMIN_MANUAL_CONFIRM     = 83   # подтверждение решения
+CONFIRM_CHECKIN_OPEN     = 90   # подтверждение отметки прихода при наличии открытой сессии
 
 SESSIONS_PER_PAGE = 5
 
@@ -233,6 +235,8 @@ async def dialog_router(message: Message):
             await _handle_ask_department(message, text); return
         if state == REQUEST_MANUAL_CHECKIN:
             await _handle_manual_checkin_time(message, text); return
+        if state == CONFIRM_CHECKIN_OPEN:
+            await _handle_confirm_checkin_open(message, text); return
         if state == SELECT_DEPT_FOR_SHIFT:
             await handle_on_shift_selection(message, text); return
         if state == SELECT_SECTOR_EXPORT:
@@ -288,14 +292,32 @@ async def _handle_ask_department(message: Message, text: str):
         await _notify_admins(f"🔔 Новая заявка!\n{full_name} (VK ID: {vk_id})\nСектор: {key}")
 
 
+async def _handle_confirm_checkin_open(message: Message, text: str):
+    """Обрабатывает ответ пользователя на предупреждение об открытой сессии перед отметкой прихода."""
+    vk_id = message.from_id
+    sm.clear("vk", vk_id)
+
+    if text != "✅ Да, всё равно отметить приход":
+        await message.answer("Отметка прихода отменена.", keyboard=make_main_keyboard(vk_id))
+        return
+
+    from vkbottle import Keyboard as KB, OpenLink
+    kb = KB(inline=True)
+    kb.add(OpenLink(
+        link=f"https://tabel-opk.ru/static/checkin.html?vk_id={vk_id}",
+        label="📍 Отметить приход"
+    ))
+    await message.answer("Хорошо, нажмите кнопку для отметки прихода:", keyboard=make_main_keyboard(vk_id))
+    await message.answer("Нажмите кнопку для отметки прихода:", keyboard=kb)
+
+
 async def _handle_manual_checkin_time(message: Message, text: str):
     vk_id = message.from_id
     try:
-        naive = datetime.strptime(text, "%H:%M")
-        now   = datetime.now(MOSCOW_TZ)
-        dt    = now.replace(hour=naive.hour, minute=naive.minute, second=0, microsecond=0)
+        naive = datetime.strptime(text, "%d.%m.%Y %H:%M")
+        dt    = MOSCOW_TZ.localize(naive)
     except ValueError:
-        await message.answer("Неверный формат. Введите время как ЧЧ:ММ, например: 09:30")
+        await message.answer("Неверный формат. Введите время как ДД.ММ.ГГГГ ЧЧ:ММ, например: 13.06.2026 09:30")
         return
     user = db.get_user_by_vk_id(vk_id)
     logger.info(f"Manual checkin: user={user}, dt={dt}")
@@ -343,6 +365,19 @@ async def handle_buttons(message: Message, text: str):
     if text == "📍 Отметить приход":
         if not authed and not is_admin(vk_id):
             await message.answer("❌ Вы не авторизованы.", keyboard=make_unauth_keyboard()); return
+
+        if db.has_open_session(vk_id=vk_id):
+            kb = Keyboard(one_time=True)
+            kb.add(Text("✅ Да, всё равно отметить приход"), color=KeyboardButtonColor.POSITIVE)
+            kb.add(Text("❌ Отмена"), color=KeyboardButtonColor.NEGATIVE)
+            sm.set_state("vk", vk_id, CONFIRM_CHECKIN_OPEN)
+            await message.answer(
+                "⚠️ У вас уже есть открытая (незакрытая) сессия — приход без отметки ухода.\n"
+                "Вы уверены, что хотите отметить приход ещё раз?",
+                keyboard=kb
+            )
+            return
+
         from vkbottle import Keyboard as KB, OpenLink
         kb = KB(inline=True)
         kb.add(OpenLink(
@@ -362,7 +397,18 @@ async def handle_buttons(message: Message, text: str):
         if not authed and not is_admin(vk_id):
             await message.answer("❌ Вы не авторизованы.", keyboard=make_unauth_keyboard()); return
         sm.set_state("vk", vk_id, REQUEST_MANUAL_CHECKIN)
-        await message.answer("Введите время прихода в формате ЧЧ:ММ (например: 09:30).\nДля отмены: отмена"); return
+        warning_text = ""
+        if db.has_open_session(vk_id=vk_id):
+            warning_text = (
+                "⚠️ У вас уже есть открытая (незакрытая) сессия — приход без отметки ухода. "
+                "Если вы хотите отметить именно приход, а не уход, убедитесь, что это действительно нужно.\n\n"
+            )
+        await message.answer(
+            warning_text +
+            "Вы хотите запросить ручную отметку прихода.\n"
+            "Пожалуйста, укажите фактическое время вашего прихода в формате ДД.ММ.ГГГГ ЧЧ:ММ "
+            "(например, 13.06.2026 09:05).\n\nДля отмены: отмена"
+        ); return
 
     if text == "👥 Заявки":
         if not is_admin(vk_id):
@@ -469,9 +515,9 @@ async def show_manual_requests_list(message: Message):
 
 
 async def handle_admin_manual_dialog(message: Message, text: str):
-    logger.info(f"admin_manual_dialog: state={state}, text={text!r}")
     vk_id = message.from_id
     state = sm.get_state("vk", vk_id)
+    logger.info(f"admin_manual_dialog: state={state}, text={text!r}")
 
     if state == ADMIN_MANUAL_LIST:
         pending = sm.get_data("vk", vk_id, "manual_requests", [])
@@ -481,20 +527,37 @@ async def handle_admin_manual_dialog(message: Message, text: str):
             admin_uid = admin["user_id"] if admin else vk_id
             approved, failed = db.approve_all_pending_manual_checkins(admin_uid)
             sm.clear("vk", vk_id)
-            # Уведомляем пользователей у которых есть telegram_id
+            # Уведомляем пользователей через ту платформу, к которой они привязаны
             for a in approved:
-                tg_user = db.get_user_by_user_id(a["user_id"])
-                if tg_user and tg_user.get("telegram_id"):
-                    try:
-                        naive = datetime.strptime(a["checkin_time_str"], "%Y-%m-%d %H:%M:%S")
-                        t_str = naive.strftime("%d.%m.%Y %H:%M")
+                target_user = db.get_user_by_user_id(a["user_id"])
+                if not target_user:
+                    continue
+                try:
+                    naive = datetime.strptime(a["checkin_time_str"], "%Y-%m-%d %H:%M:%S")
+                    t_str = naive.strftime("%d.%m.%Y %H:%M")
+                    notify_text = f"✅ Ваша заявка одобрена. Время: {t_str}"
+
+                    target_vk_id = target_user.get("vk_id")
+                    target_tg_id = target_user.get("telegram_id")
+
+                    if target_vk_id:
                         await bot.api.messages.send(
-                            user_id=tg_user["telegram_id"] if tg_user.get("vk_id") else None,
-                            message=f"✅ Ваша заявка одобрена. Время: {t_str}",
+                            user_id=target_vk_id,
+                            message=notify_text,
                             random_id=0,
                         )
-                    except Exception:
-                        pass
+                    if target_tg_id:
+                        # Отправка в Telegram через Bot API напрямую (без зависимости от TG-бота)
+                        try:
+                            async with httpx.AsyncClient(timeout=10) as client:
+                                await client.post(
+                                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                                    json={"chat_id": target_tg_id, "text": notify_text},
+                                )
+                        except Exception as e:
+                            logger.error(f"Не удалось уведомить TG пользователя {target_tg_id}: {e}")
+                except Exception as e:
+                    logger.error(f"Ошибка уведомления пользователя user_id={a['user_id']}: {e}")
             await message.answer(
                 f"✅ Массовое одобрение завершено!\nОбработано: {len(approved)} шт.\nОшибок: {failed} шт.",
                 keyboard=make_main_keyboard(vk_id),

@@ -1357,6 +1357,21 @@ async def checkin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         db.authorize_user(user.id, user.id)
         logger.info(f"Администратор {user.id} ({user.username}) автоматически добавлен/авторизован при попытке /checkin.")
 
+    if db.has_open_session(telegram_id=user.id):
+        confirm_keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Да, всё равно отметить приход", callback_data="checkin_confirm_open_session"),
+            InlineKeyboardButton("❌ Отмена", callback_data="checkin_cancel_open_session"),
+        ]])
+        await update.message.reply_text(
+            escape_markdown_v2(
+                "⚠️ У вас уже есть открытая (незакрытая) сессия — приход без отметки ухода.\n"
+                "Вы уверены, что хотите отметить приход ещё раз?"
+            ),
+            reply_markup=confirm_keyboard,
+            parse_mode=ParseMode.MARKDOWN_V2
+        )
+        return
+
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton(
             "📍 Отметить приход",
@@ -1367,6 +1382,30 @@ async def checkin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         escape_markdown_v2("Нажмите кнопку для отметки прихода:"),
         reply_markup=keyboard,
         parse_mode=ParseMode.MARKDOWN_V2
+    )
+
+
+async def checkin_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обрабатывает подтверждение/отмену отметки прихода при наличии открытой сессии."""
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+
+    if query.data == "checkin_cancel_open_session":
+        await query.edit_message_text("Отметка прихода отменена.")
+        return
+
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            "📍 Отметить приход",
+            web_app=WebAppInfo(url=f"https://tabel-opk.ru/static/checkin.html?telegram_id={user.id}")
+        )
+    ]])
+    await query.edit_message_text("Нажмите кнопку для отметки прихода:")
+    await context.bot.send_message(
+        chat_id=user.id,
+        text="Нажмите кнопку для отметки прихода:",
+        reply_markup=keyboard
     )
 
 async def checkout_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1512,7 +1551,15 @@ async def request_manual_checkin_start(update: Update, context: ContextTypes.DEF
         await update.message.reply_text("Эта функция доступна только для авторизованных пользователей.")
         return ConversationHandler.END
 
+    warning_text = ""
+    if db.has_open_session(telegram_id=user.id):
+        warning_text = (
+            "⚠️ У вас уже есть открытая (незакрытая) сессия — приход без отметки ухода. "
+            "Если вы хотите отметить именно приход, а не уход, убедитесь, что это действительно нужно.\n\n"
+        )
+
     await update.message.reply_text(
+        warning_text +
         "Вы хотите запросить ручную отметку прихода.\n"
         "Пожалуйста, укажите фактическое время вашего прихода в формате **ДД.ММ.ГГГГ ЧЧ:ММ** "
         "(например, `15.06.2025 09:05`).\n\n"
@@ -1730,23 +1777,23 @@ async def approve_all_requests_callback(update: Update, context: ContextTypes.DE
     # --- НАЧАЛО ГЛАВНОГО ИСПРАВЛЕНИЯ: ЦИКЛ УВЕДОМЛЕНИЙ ---
     sent_notifications = 0
     for approval_data in approved_list:
+        target_tg_id = approval_data.get('telegram_id')
+        if not target_tg_id:
+            logger.info(f"Массовое одобрение: у пользователя user_id={approval_data['user_id']} нет telegram_id (VK-пользователь), уведомление в TG не отправлено.")
+            continue
         try:
-            user_id = approval_data['user_id']
-            
-            # Превращаем строку времени в объект для красивого форматирования
             naive_dt = datetime.strptime(approval_data['checkin_time_str'], '%Y-%m-%d %H:%M:%S')
             time_str_for_user = naive_dt.strftime('%d.%m.%Y %H:%M')
 
-
             await context.bot.send_message(
-                chat_id=user_id,
+                chat_id=target_tg_id,
                 text=f"✅ Ваша заявка на ручную отметку одобрена. Установленное время: {time_str_for_user}"
             )
             sent_notifications += 1
         except Forbidden:
-            logger.warning(f"Массовое одобрение: Не удалось отправить уведомление пользователю {user_id}, т.к. бот заблокирован.")
+            logger.warning(f"Массовое одобрение: Не удалось отправить уведомление пользователю {target_tg_id}, т.к. бот заблокирован.")
         except Exception as e:
-            logger.error(f"Массовое одобрение: Не удалось отправить уведомление пользователю {user_id}: {e}")
+            logger.error(f"Массовое одобрение: Не удалось отправить уведомление пользователю {target_tg_id}: {e}")
     # --- КОНЕЦ ГЛАВНОГО ИСПРАВЛЕНИЯ ---
 
 
@@ -1959,21 +2006,22 @@ async def admin_handle_final_confirmation(update: Update, context: ContextTypes.
     if action == "reject":
         db.reject_manual_checkin_request(req['request_id'], admin_id)
         
-        # --- НАЧАЛО ИСПРАВЛЕНИЯ: делаем отправку надежной ---
         try:
             await query.edit_message_text(f"❌ Заявка от <b>{user_info}</b> отклонена.", parse_mode=ParseMode.HTML, reply_markup=None)
         except Exception as e:
             logger.error(f"Ошибка при редактировании сообщения для отклонения заявки {req['request_id']}: {e}")
 
-
-        try:
-            await context.bot.send_message(req['user_id'], "❌ Ваша заявка на ручную отметку была отклонена.")
-            logger.info(f"Уведомление об отклонении отправлено пользователю {req['user_id']}.")
-        except Forbidden:
-            logger.warning(f"Не удалось отправить уведомление об отклонении пользователю {req['user_id']}, т.к. бот заблокирован.")
-        except Exception as e:
-            logger.error(f"Не удалось отправить уведомление об отклонении пользователю {req['user_id']}: {e}")
-        # --- КОНЕЦ ИСПРАВЛЕНИЯ ---
+        target_tg_id = req.get('telegram_id')
+        if target_tg_id:
+            try:
+                await context.bot.send_message(target_tg_id, "❌ Ваша заявка на ручную отметку была отклонена.")
+                logger.info(f"Уведомление об отклонении отправлено пользователю {target_tg_id}.")
+            except Forbidden:
+                logger.warning(f"Не удалось отправить уведомление об отклонении пользователю {target_tg_id}, т.к. бот заблокирован.")
+            except Exception as e:
+                logger.error(f"Не удалось отправить уведомление об отклонении пользователю {target_tg_id}: {e}")
+        else:
+            logger.info(f"У заявки {req['request_id']} нет telegram_id (VK-пользователь) — уведомление в TG не отправлено.")
 
 
     else: # 'approve_as_is' или 'approve_new_time'
@@ -1991,21 +2039,22 @@ async def admin_handle_final_confirmation(update: Update, context: ContextTypes.
         db.approve_manual_checkin_request(req['request_id'], admin_id, checkin_time, req['user_id'], req['application_department'])
         time_str = checkin_time.strftime('%d.%m.%Y %H:%M')
         
-        # --- НАЧАЛО ИСПРАВЛЕНИЯ: делаем отправку надежной ---
         try:
             await query.edit_message_text(f"✅ Заявка от <b>{user_info}</b> {final_message_action} на время <b>{time_str}</b>.", parse_mode=ParseMode.HTML, reply_markup=None)
         except Exception as e:
             logger.error(f"Ошибка при редактировании сообщения для одобрения заявки {req['request_id']}: {e}")
 
-
-        try:
-            await context.bot.send_message(req['user_id'], f"✅ Ваша заявка на ручной приход одобрена. Установленное время: {time_str}")
-            logger.info(f"Уведомление об одобрении отправлено пользователю {req['user_id']}.")
-        except Forbidden:
-            logger.warning(f"Не удалось отправить уведомление об одобрении пользователю {req['user_id']}, т.к. бот заблокирован.")
-        except Exception as e:
-            logger.error(f"Не удалось отправить уведомление об одобрении пользователю {req['user_id']}: {e}")
-        # --- КОНЕЦ ИСПРАВЛЕНИЯ ---
+        target_tg_id = req.get('telegram_id')
+        if target_tg_id:
+            try:
+                await context.bot.send_message(target_tg_id, f"✅ Ваша заявка на ручной приход одобрена. Установленное время: {time_str}")
+                logger.info(f"Уведомление об одобрении отправлено пользователю {target_tg_id}.")
+            except Forbidden:
+                logger.warning(f"Не удалось отправить уведомление об одобрении пользователю {target_tg_id}, т.к. бот заблокирован.")
+            except Exception as e:
+                logger.error(f"Не удалось отправить уведомление об одобрении пользователю {target_tg_id}: {e}")
+        else:
+            logger.info(f"У заявки {req['request_id']} нет telegram_id (VK-пользователь) — уведомление в TG не отправлено.")
 
 
     context.user_data.clear()
@@ -2485,9 +2534,11 @@ def format_seconds_to_hhmmss(seconds_val):
 async def generate_custom_excel_report(report_data: list, report_info: dict, selected_sector_key: str) -> bytes:
     """
     Генерирует Excel-отчет, с правильной сортировкой и без ошибок типов.
+    Длительность сессии записывается как настоящее время Excel (число),
+    с форматом ячейки [h]:mm:ss, что позволяет корректно суммировать
+    длительности (в том числе свыше 24 часов).
     """
     if not report_data:
-        # ... (эта часть остается без изменений) ...
         logger.info("Нет данных для генерации Excel отчета.")
         df_empty = pd.DataFrame([{"Сообщение": "Нет данных для отображения в выбранных параметрах"}])
         output = io.BytesIO()
@@ -2511,10 +2562,14 @@ async def generate_custom_excel_report(report_data: list, report_info: dict, sel
 
             df_details['session_start_time'] = pd.to_datetime(df_details['session_start_time'], errors='coerce')
             df_details['session_end_time'] = pd.to_datetime(df_details['session_end_time'], errors='coerce')
-            
+
             duration = df_details['session_end_time'] - df_details['session_start_time']
-            df_details['Длительность сессии'] = duration.dt.total_seconds().apply(format_seconds_to_hhmmss)
-            
+            # Длительность как число дней (float) — это "родной" формат времени Excel.
+            # Например, 8 часов = 8/24 = 0.3333... дня. Ячейка с форматом [h]:mm:ss
+            # отображает это как часы:минуты:секунды и корректно суммируется.
+            duration_days = duration.dt.total_seconds() / 86400.0
+            df_details['Длительность сессии'] = duration_days  # NaN для активных сессий — ок, останется пустой
+
             df_details.rename(columns={
                 'application_full_name': 'ФИО',
                 'username': 'Telegram Username',
@@ -2522,46 +2577,82 @@ async def generate_custom_excel_report(report_data: list, report_info: dict, sel
                 'session_start_time': 'Начало сессии',
                 'session_end_time': 'Конец сессии'
             }, inplace=True)
-            
+
             final_columns = ['ФИО', 'Telegram Username', 'Сектор', 'Начало сессии', 'Конец сессии', 'Длительность сессии']
             existing_columns = [col for col in final_columns if col in df_details.columns]
             df_sheet_final = df_details[existing_columns]
 
 
             df_sorted = df_sheet_final.sort_values(
-                by=['ФИО', 'Начало сессии'], 
+                by=['ФИО', 'Начало сессии'],
                 ascending=[True, False]
             ).reset_index(drop=True)
-            
-            # --- НАЧАЛО ГЛАВНОГО ИСПРАВЛЕНИЯ ---
-            # Шаг 1: Форматируем даты в строки ДО того, как добавлять пустые строки.
-            # Теперь df_sorted содержит только строки, а не смешанные типы.
-            df_sorted['Начало сессии'] = df_sorted['Начало сессии'].dt.strftime('%Y-%m-%d %H:%M:%S').replace('NaT', 'Активна')
-            df_sorted['Конец сессии'] = df_sorted['Конец сессии'].dt.strftime('%Y-%m-%d %H:%M:%S').replace('NaT', '')
-            # --- КОНЕЦ ГЛАВНОГО ИСПРАВЛЕНИЯ ---
-            
-            new_rows = []
+
+            # Форматируем даты начала/конца в текст (это просто для отображения,
+            # на суммирование длительности это не влияет — она остаётся числом).
+            start_str = df_sorted['Начало сессии'].dt.strftime('%Y-%m-%d %H:%M:%S')
+            end_str = df_sorted['Конец сессии'].dt.strftime('%Y-%m-%d %H:%M:%S')
+            df_sorted['Начало сессии'] = start_str.where(df_sorted['Начало сессии'].notna(), 'Активна')
+            df_sorted['Конец сессии'] = end_str.where(df_sorted['Конец сессии'].notna(), '')
+
+            # Собираем итоговые строки с разделительными пустыми строками между
+            # сотрудниками и строкой "Итого" с суммой длительности по каждому.
+            output_rows = []
+            sum_rows_idx = []  # индексы строк "Итого" в итоговом списке (1-based с учётом заголовка)
             last_name = None
-            blank_row = pd.Series([''] * len(df_sorted.columns), index=df_sorted.columns)
+            current_person_total = 0.0
+            columns = list(df_sorted.columns)
+            blank_row = {col: '' for col in columns}
 
+            def make_total_row(name, total_days):
+                row = {col: '' for col in columns}
+                row['ФИО'] = f"Итого, {name}"
+                row['Длительность сессии'] = total_days
+                return row
 
-            for index, row in df_sorted.iterrows():
+            for _, row in df_sorted.iterrows():
                 current_name = row['ФИО']
                 if last_name is not None and current_name != last_name:
-                    new_rows.append(blank_row)
-                
-                new_rows.append(row)
+                    output_rows.append(make_total_row(last_name, current_person_total))
+                    output_rows.append(dict(blank_row))
+                    current_person_total = 0.0
+
+                row_dict = row.to_dict()
+                dur_val = row_dict.get('Длительность сессии')
+                if isinstance(dur_val, (int, float)) and not pd.isna(dur_val):
+                    current_person_total += dur_val
+                output_rows.append(row_dict)
                 last_name = current_name
-            
-            # Теперь мы смешиваем строки со строками, что абсолютно безопасно.
-            df_with_spacing = pd.DataFrame(new_rows)
-            
-            # Старый блок форматирования здесь больше не нужен, мы его перенесли наверх.
-            
+
+            if last_name is not None:
+                output_rows.append(make_total_row(last_name, current_person_total))
+
+            df_with_spacing = pd.DataFrame(output_rows, columns=columns)
+
             df_with_spacing.to_excel(writer, sheet_name=sheet_name_param, index=False)
-            
-            # ... (остальная часть функции по форматированию листа остается без изменений) ...
-            worksheet = writer.book[sheet_name_param]   
+
+            worksheet = writer.book[sheet_name_param]
+
+            # Находим номер столбца "Длительность сессии" для применения формата времени.
+            duration_col_idx = None
+            for idx, col_name in enumerate(columns, start=1):
+                if col_name == 'Длительность сессии':
+                    duration_col_idx = idx
+                    break
+
+            if duration_col_idx is not None:
+                duration_col_letter = worksheet.cell(row=1, column=duration_col_idx).column_letter
+                bold_font = Font(bold=True)
+                for row_idx in range(2, worksheet.max_row + 1):
+                    cell = worksheet.cell(row=row_idx, column=duration_col_idx)
+                    if isinstance(cell.value, (int, float)):
+                        # [h]:mm:ss — формат времени, который умеет суммировать свыше 24 часов
+                        cell.number_format = '[h]:mm:ss'
+                    fio_cell = worksheet.cell(row=row_idx, column=1)
+                    if isinstance(fio_cell.value, str) and fio_cell.value.startswith('Итого, '):
+                        fio_cell.font = bold_font
+                        cell.font = bold_font
+
             for column_cells in worksheet.columns:
                 try:
                     max_length = 0
@@ -2578,7 +2669,6 @@ async def generate_custom_excel_report(report_data: list, report_info: dict, sel
             logger.info(f"Лист '{sheet_name_param}' успешно добавлен в Excel.")
 
 
-        # ... (остальная часть функции по разделению на листы остается без изменений) ...
         if selected_sector_key.upper() == 'ALL':
             if 'application_department' not in df_all_data.columns:
                 logger.error("Столбец 'application_department' отсутствует в данных, не могу разделить по секторам.")
@@ -3529,6 +3619,7 @@ def main() -> None:
     application.add_handler(MessageHandler(filters.LOCATION, location_handler))
     
     application.add_handler(CallbackQueryHandler(on_shift_button_press, pattern=r"^on_shift_"))
+    application.add_handler(CallbackQueryHandler(checkin_confirm_callback, pattern=r"^checkin_(confirm|cancel)_open_session$"))
     application.add_handler(CallbackQueryHandler(admin_action_callback_handler, pattern=r'^(view_user_app:|card_auth_app:|card_reject_app:|focus_in_list:|paginate_list:)'))
     
     # --- ЗАПУСК БОТА ---
@@ -3540,15 +3631,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-
-
-
-
-
-
